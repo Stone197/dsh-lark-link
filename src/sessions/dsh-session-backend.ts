@@ -31,7 +31,14 @@ export interface AttachmentInput {
 export type SessionEventOut =
   | { type: "turn/start" }
   | { type: "assistant/chunk"; text: string }
-  | { type: "assistant/message"; text: string }
+  /**
+   * `messageId` is DSH's stable AssistantMessage.id. It is the ONLY reliable
+   * identity for one assistant output (GH #15): the outbound forwarder derives
+   * its outbox idempotency key from it, so a duplicated session/event
+   * delivery (leaked subscription, replayed event) can never produce two
+   * Feishu messages. Optional so mocks older than the field still typecheck.
+   */
+  | { type: "assistant/message"; text: string; messageId?: string }
   | { type: "turn/end"; reason: string; finalText?: string }
   | { type: "tool/call"; name: string }
   | { type: "tool/result"; name: string; error?: { name: string; code: string } }

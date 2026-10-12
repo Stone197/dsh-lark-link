@@ -40,7 +40,7 @@
 | 💬 **意图确认转发** | 模型提问（`ask_user_question`）→ **飞书意图确认卡片**（选项按钮 + 下拉多选 + 自定义输入），答完模型继续，飞书里完成完整交互闭环 |
 | 😊 **表情回执** | 收到消息随机表情"已收到"；回复完成 / 命令完成打 **DONE ✅**（只使用飞书实测有效 emoji） |
 | 💪 **出站零丢失** | 持久 Outbox（JSONL + at-least-once + 幂等键 + 分航道并行 + 失败离队不阻塞 + 周期清理），kill 重启自动续投；桥命令回复同样走 Outbox |
-| 🆕 **入站请求补发** | Agent **处理到一半**插件/dsh 崩溃/重启，重启后自动重新触发这条用户消息（不再静默丢请求）——Inbound WAL 持久化 + 启动对账 + 次数上限/时间窗防空转；`/status` 显示待补发条数 |
+| 🆕 **入站请求补发** | Agent **处理到一半**插件/dsh 崩溃/重启，重启后自动重新触发这条用户消息（不再静默丢请求）——Inbound WAL 持久化 + 启动对账 + 次数上限/时间窗防空转；`/status` 显示待补发条数。**可关**：`/lark-config replay.auto=false`（或 `DSH_LARK_AUTO_REPLAY=0`）后改为 `/lark replay` 手动触发；超窗/耗尽的记录标记 failed 并可 `replay drop` 丢弃 |
 | 🛡 **连接自愈** | probe 驱动受控重连 + QuotaGovernor 配额熔断（窗口过期**自动解除、自动重连**）+ 断连补偿；环境代理自动规避 |
 | 🔀 **命令三级分流** | 桥特有命令桥处理；DSH 注册命令原生执行；`/goal`、未知 `/xxx`、普通消息原样注入 Agent（无拦截无门禁）；**skill 无前缀**——直接描述任务，模型自动加载 |
 | 📎 **入站多媒体** | 飞书图片 → **视觉模型看图**（attachment 存储）；文件 → 有界文本提取进提示词 |
@@ -113,6 +113,7 @@ dsh web
 ```
 /lark setup            扫码一键建应用（或 DSH_LARK_APP_ID/SECRET 手动通道）
 /lark start|stop|restart|status   桥接生命周期与全链路健康
+/lark replay           手动补发入站请求；`replay list` 查看 WAL、`replay drop <id>` 丢弃、`replay auto on|off` 切换启动自动补发
 /lark uninstall-clean  清除凭据与状态目录
 ```
 
@@ -206,7 +207,7 @@ MIT — 自由使用、修改、分发。
 | 💬 **Intent confirmation** | Model questions (`ask_user_question`) land as **Feishu intent-confirmation cards** (option buttons + multi-select dropdown + custom text); answer and the agent resumes |
 | 😊 **Reaction receipts** | Random "got it" reaction on inbound; **DONE ✅** on completion (only Feishu-validated emojis) |
 | 💪 **Outbound zero-loss** | Persistent Outbox (JSONL + at-least-once + idempotency + per-lane parallel + failure quarantine + periodic prune), resumes after kill/restart; bridge command replies ride the Outbox too |
-| 🆕 **Inbound request replay** | If the agent dies / plugin reloads / dsh restarts MID-TURN, the interrupted user message is auto re-triggered on boot (no more silently dropped requests) — durable Inbound WAL + boot reconciliation + attempt/time caps; `/status` shows the pending-replay count |
+| 🆕 **Inbound request replay** | If the agent dies / plugin reloads / dsh restarts MID-TURN, the interrupted user message is auto re-triggered on boot (no more silently dropped requests) — durable Inbound WAL + boot reconciliation + attempt/time caps; `/status` shows the pending-replay count. **Opt out**: `/lark-config replay.auto=false` (or `DSH_LARK_AUTO_REPLAY=0`), then trigger manually with `/lark replay`; expired/exhausted records are surfaced as failed and droppable via `replay drop` |
 | 🛡 **Self-healing connection** | Probe-driven controlled reconnect + QuotaGovernor circuit breaker (auto-unblocks and reconnects after the quota window) + missed-message compensation; auto-avoids proxy env |
 | 🔀 **3-tier command routing** | Bridge commands → bridge; DSH commands → native; `/goal`, unknown `/xxx`, plain text → injected verbatim (no gates). **Skills need no prefix** — just describe the task |
 | 📎 **Inbound media** | Feishu images → **visual model** (attachment-backed); files → bounded text extraction |

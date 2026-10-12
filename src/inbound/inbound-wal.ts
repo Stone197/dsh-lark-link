@@ -45,6 +45,8 @@ export interface InboundWalRecord {
   acceptedAt: number;
   attempts: number;
   state: InboundWalState;
+  /** When the record entered the terminal failed state (GH #14 prune). */
+  failedAt?: number;
 }
 
 export interface InboundWalDeps {
@@ -53,6 +55,11 @@ export interface InboundWalDeps {
   replayRetentionMs?: number;
   /** Max times a record is re-attempted before it stops being replayed. */
   maxReplayAttempts?: number;
+  /**
+   * GH #14: how long a failed record stays inspectable (/status,
+   * `/lark replay list`) before prune() deletes it. Default 7 days.
+   */
+  failedRetentionMs?: number;
   now?: () => number;
 }
 
@@ -80,12 +87,15 @@ export interface InboundWal {
   /** GH #9: how many records failed delivery (surfaced in /status). */
   failedCount(): number;
   pendingCount(): number;
+  /** GH #14: all records (oldest first, copies) for `/lark replay list`. */
+  list(): InboundWalRecord[];
 }
 
 export function createInboundWal(deps: InboundWalDeps): InboundWal {
   const dir = deps.dir;
   const replayRetentionMs = deps.replayRetentionMs ?? 30 * 60_000; // 30 min
   const maxReplayAttempts = deps.maxReplayAttempts ?? 2;
+  const failedRetentionMs = deps.failedRetentionMs ?? 7 * 24 * 60 * 60_000; // 7 d
   const now = deps.now ?? Date.now;
   mkdirSync(dir, { recursive: true });
 
@@ -159,6 +169,7 @@ export function createInboundWal(deps: InboundWalDeps): InboundWal {
       const rec = records.get(messageId);
       if (!rec || rec.state === "delivered" || rec.state === "failed") return;
       rec.state = "failed";
+      rec.failedAt = now();
       persistAll();
     },
     markReplay(messageId) {
@@ -170,11 +181,21 @@ export function createInboundWal(deps: InboundWalDeps): InboundWal {
         // instead of lingering as accepted (invisible-but-unresolved).
         if (rec.state !== "failed") {
           rec.state = "failed";
+          rec.failedAt = now();
           persistAll();
         }
         return false;
       }
-      if (now() - rec.acceptedAt > replayRetentionMs) return false;
+      if (now() - rec.acceptedAt > replayRetentionMs) {
+        // GH #14: out of the replay window → terminal too (same invariant:
+        // every record is either replayable or failed, never limbo).
+        if (rec.state !== "failed") {
+          rec.state = "failed";
+          rec.failedAt = now();
+          persistAll();
+        }
+        return false;
+      }
       rec.attempts += 1;
       rec.state = "replayed";
       persistAll();
@@ -193,18 +214,38 @@ export function createInboundWal(deps: InboundWalDeps): InboundWal {
         .sort((a, b) => a.acceptedAt - b.acceptedAt);
     },
     prune() {
-      const deliveredCutoff = now() - replayRetentionMs;
+      const nowMs = now();
+      const deliveredCutoff = nowMs - replayRetentionMs;
+      const failedCutoff = nowMs - failedRetentionMs;
       let changed = false;
       for (const [id, r] of records) {
-        // Delivered/failed records age out after retention; never-delivered
-        // records are retained only while still within the replay window and
-        // attempt budget.
-        const expired =
-          r.state === "delivered" || r.state === "failed"
-            ? r.acceptedAt < deliveredCutoff
-            : r.acceptedAt < deliveredCutoff && r.attempts >= maxReplayAttempts;
-        if (expired) {
-          records.delete(id);
+        if (r.state === "delivered") {
+          // Delivered records age out after the replay window (unchanged).
+          if (r.acceptedAt < deliveredCutoff) {
+            records.delete(id);
+            changed = true;
+          }
+          continue;
+        }
+        if (r.state === "failed") {
+          // GH #14: failed records stay inspectable for failedRetentionMs,
+          // then are deleted (dated from when they FAILED, not accepted —
+          // otherwise a just-expired record would vanish the same prune).
+          if ((r.failedAt ?? r.acceptedAt) < failedCutoff) {
+            records.delete(id);
+            changed = true;
+          }
+          continue;
+        }
+        // accepted | replayed — still replayable? If not, terminal-mark it
+        // NOW (GH #14): before this, an out-of-window record under the
+        // attempt cap was neither replayed nor pruned nor counted anywhere —
+        // permanent invisible limbo.
+        const replayable =
+          r.attempts < maxReplayAttempts && r.acceptedAt >= deliveredCutoff;
+        if (!replayable) {
+          r.state = "failed";
+          r.failedAt = nowMs;
           changed = true;
         }
       }
@@ -216,6 +257,10 @@ export function createInboundWal(deps: InboundWalDeps): InboundWal {
     failedCount: () =>
       [...records.values()].filter((r) => r.state === "failed").length,
     pendingCount: () => records.size,
+    list: () =>
+      [...records.values()]
+        .sort((a, b) => a.acceptedAt - b.acceptedAt)
+        .map((r) => ({ ...r })),
   };
 }
 

@@ -142,6 +142,44 @@ test("forwarder: session without route is ignored", async () => {
 // turn's final assistant text (finalText) and the forwarder enqueues it
 // durably whenever nothing was delivered this turn.
 
+// ---- GH #15: duplicate delivery suppression -------------------------------
+// A leaked session/event subscription (agent rebuilt over a stale listener)
+// delivered the SAME assistant/message event to the forwarder twice. The old
+// `text.length:Date.now()` dedupe key was unique per enqueue, so both copies
+// were sent to Feishu 1–2ms apart. With the stable messageId key, the outbox
+// collapses duplicates — while distinct messages of equal length still deliver.
+
+test("forwarder GH #15: duplicate assistant/message (same messageId) is delivered ONCE", async () => {
+  const { fw, sent } = makeForwarder({ streaming: false });
+  await fw.onSessionEvent("dm:ou_x", { type: "assistant/message", text: "dup", messageId: "m1" });
+  await fw.onSessionEvent("dm:ou_x", { type: "assistant/message", text: "dup", messageId: "m1" });
+  await new Promise((r) => setTimeout(r, 200));
+  const texts = sent.filter((p) => (p as { kind: string }).kind === "text" && (p as { text: string }).text === "dup");
+  assert.equal(texts.length, 1, "leaked-subscription duplicate must be suppressed by the outbox dedupe");
+});
+
+test("forwarder GH #15: distinct messages with EQUAL length all deliver (no false dedupe)", async () => {
+  const { fw, sent } = makeForwarder({ streaming: false });
+  await fw.onSessionEvent("dm:ou_x", { type: "assistant/message", text: "aaaa", messageId: "m1" });
+  await fw.onSessionEvent("dm:ou_x", { type: "assistant/message", text: "bbbb", messageId: "m2" });
+  await new Promise((r) => setTimeout(r, 200));
+  const texts = sent.filter((p) => (p as { kind: string }).kind === "text");
+  assert.equal(texts.length, 2, "two different replies must both be delivered");
+});
+
+test("forwarder GH #15: duplicate turn/end rescue runs only one durable enqueue", async () => {
+  const { fw, sent } = makeForwarder({ streaming: false });
+  await fw.onSessionEvent("dm:ou_x", { type: "turn/start" });
+  // The same lost-reply turn/end delivered twice by duplicated subscriptions.
+  await Promise.all([
+    fw.onSessionEvent("dm:ou_x", { type: "turn/end", reason: "complete", finalText: "rescued once" }),
+    fw.onSessionEvent("dm:ou_x", { type: "turn/end", reason: "complete", finalText: "rescued once" }),
+  ]);
+  await new Promise((r) => setTimeout(r, 200));
+  const texts = sent.filter((p) => (p as { kind: string }).kind === "text" && (p as { text: string }).text === "rescued once");
+  assert.equal(texts.length, 1, "concurrent duplicate rescues must not double-send");
+});
+
 test("forwarder: turn/end rescue enqueues finalText when no assistant/message was delivered (GH #9)", async () => {
   const { fw, sent, doneCount } = makeForwarder({ streaming: false });
   await fw.onSessionEvent("dm:ou_x", { type: "turn/start" });

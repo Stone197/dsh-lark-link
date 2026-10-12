@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { join } from "node:path";
 import {
   deepMerge,
   createConfigStore,
@@ -104,4 +105,48 @@ test("buildHotReloadPatch: unknown attachments sub-key still throws", () => {
 test("attachments default retention is 7 days (168h) — survives multi-day sessions on any OS", () => {
 	assert.equal(DEFAULT_CONFIG.attachments.retentionHours, 168);
 	assert.equal(DEFAULT_CONFIG.attachments.dir, "", "empty dir = OS temp dir default");
+});
+
+// ---- GH #14: replay switches ------------------------------------------------
+
+test("config: replay defaults preserve zero-loss auto-replay (30min window, 2 attempts)", () => {
+	assert.deepEqual(DEFAULT_CONFIG.replay, {
+		auto: true,
+		retentionMinutes: 30,
+		maxAttempts: 2,
+	});
+	assert.ok(HOT_RELOADABLE.includes("replay"), "replay is hot-reloadable");
+});
+
+test("config: /lark-config replay.auto=false patches the nested key without losing siblings", () => {
+	const patch = buildHotReloadPatch("replay.auto", false);
+	assert.deepEqual(patch, { replay: { auto: false } });
+	const store = createConfigStore(
+		join(process.env.TMPDIR ?? "/tmp", `cfg-replay-${Date.now()}-${Math.random().toString(36).slice(2)}`),
+	);
+	store.update(patch);
+	store.saveOverrides();
+	const cfg = store.get();
+	assert.equal(cfg.replay.auto, false);
+	assert.equal(cfg.replay.retentionMinutes, 30, "siblings preserved by deep merge");
+	assert.equal(cfg.replay.maxAttempts, 2);
+});
+
+test("config: autoReplayEnabled honors env DSH_LARK_AUTO_REPLAY over config", async () => {
+	const { autoReplayEnabled } = await import("../../../src/common/config.ts");
+	const prev = process.env.DSH_LARK_AUTO_REPLAY;
+	try {
+		delete process.env.DSH_LARK_AUTO_REPLAY;
+		assert.equal(autoReplayEnabled(true), true, "unset → config value");
+		assert.equal(autoReplayEnabled(false), false);
+		process.env.DSH_LARK_AUTO_REPLAY = "0";
+		assert.equal(autoReplayEnabled(true), false, "env 0 wins over config true");
+		process.env.DSH_LARK_AUTO_REPLAY = "off";
+		assert.equal(autoReplayEnabled(true), false);
+		process.env.DSH_LARK_AUTO_REPLAY = "1";
+		assert.equal(autoReplayEnabled(false), true, "env 1 forces on");
+	} finally {
+		if (prev === undefined) delete process.env.DSH_LARK_AUTO_REPLAY;
+		else process.env.DSH_LARK_AUTO_REPLAY = prev;
+	}
 });

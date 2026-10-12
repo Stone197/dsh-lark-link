@@ -252,6 +252,8 @@ const ctxOf = (
 			if (name === "agentPresets") return agentPresets;
 			return undefined;
 		},
+		// GH #15 test hook: live plugin-ctx session/event subscription count.
+		sessionListenerCount: () => sessionListeners.size,
 	};
 	if (registry?.agentCtxHolder) {
 		registry.agentCtxHolder.ctx = ctxObj;
@@ -1073,4 +1075,72 @@ test("adapter: image-retry grace is one-shot and only set when a retry fires", a
 	assert.equal(agent.followups.length, 3, "1 text + 1 image + 1 text-only retry");
 	assert.equal(backend.consumeImageRetryGrace?.(key), true, "first consume wins");
 	assert.equal(backend.consumeImageRetryGrace?.(key), false, "one-shot: second consume is false");
+});
+
+// ---- GH #15: subscription disposal + messageId passthrough ----------------
+
+test("adapter GH #15: dispose removes BOTH session/event and agent/error subscriptions (no leak)", async () => {
+	const registry = fakeRegistry();
+	const ctx = ctxOf(registry, undefined) as Parameters<
+		typeof createDshAdapter
+	>[0]["ctx"] & { sessionListenerCount(): number };
+	const backend = mkBackend(ctx);
+	await backend.ensureAgent("dm:ou_dup");
+	assert.equal(ctx.sessionListenerCount(), 1, "one live plugin-ctx subscription");
+	// Before the fix the agent/error disposer OVERWROTE the session/event
+	// disposer in the disposers Map, so dispose() left the (long-lived,
+	// plugin-ctx) session/event listener attached forever → every agent
+	// rebuild duplicated deliveries.
+	await backend.dispose("dm:ou_dup");
+	assert.equal(
+		ctx.sessionListenerCount(),
+		0,
+		"session/event subscription must be unsubscribed on dispose",
+	);
+});
+
+test("adapter GH #15: rebuilt agent over the same key never stacks subscriptions", async () => {
+	const registry = fakeRegistry();
+	const ctx = ctxOf(registry, undefined) as Parameters<
+		typeof createDshAdapter
+	>[0]["ctx"] & { sessionListenerCount(): number };
+	const backend = mkBackend(ctx);
+	// Idle-disposal + rebuild cycle (the exact scenario from the issue:
+	// resume / rotate / idle回收 recreates the agent while the stale
+	// subscription stayed live).
+	await backend.ensureAgent("dm:ou_cycle");
+	await backend.dispose("dm:ou_cycle");
+	await backend.ensureAgent("dm:ou_cycle");
+	assert.equal(ctx.sessionListenerCount(), 1, "exactly one subscription after rebuild");
+	await backend.dispose("dm:ou_cycle");
+	assert.equal(ctx.sessionListenerCount(), 0);
+});
+
+test("adapter GH #15: assistant/message carries DSH's stable message id downstream", async () => {
+	const registry = fakeRegistry();
+	const ctx = ctxOf(registry, undefined);
+	const backend = mkBackend(ctx);
+	const handle = await backend.ensureAgent("dm:ou_mid");
+	const seen: Array<{ type: string; messageId?: string }> = [];
+	handle.onEvent((e) => seen.push(e as { type: string; messageId?: string }));
+	const agent = registry.agents.get(handle.sessionId) as {
+		session: { id: string };
+	};
+	// Emit through the plugin ctx exactly like the real DSH event bus.
+	(ctx as unknown as { emit(e: string, s: unknown, ev: unknown): void }).emit(
+		"session/event",
+		agent.session,
+		{
+			type: "assistant/message",
+			data: {
+				message: {
+					id: "msg_abc123",
+					content: [{ type: "text", text: "hello" }],
+				},
+			},
+		},
+	);
+	const msg = seen.find((e) => e.type === "assistant/message");
+	assert.ok(msg, "assistant/message forwarded");
+	assert.equal(msg?.messageId, "msg_abc123", "stable id threaded for dedupe keying");
 });

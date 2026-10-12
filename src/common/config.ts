@@ -94,6 +94,19 @@ export interface FeishuConfig {
 	agentPreset: string;
 	/** Default DSH permission preset (read-only | workspace-write | danger-full-access). */
 	permissionMode: string;
+	/**
+	 * Inbound request replay (入站请求补发) tuning (GH #14).
+	 * `auto: false` disables the BOOT-TIME automatic replay — accepted but
+	 * undelivered requests then stay in the WAL and can be re-dispatched on
+	 * demand via `/lark replay`. Manual replay is never gated by this switch.
+	 */
+	replay: {
+		auto: boolean;
+		/** Replay window in minutes: how long an undelivered request stays eligible. */
+		retentionMinutes: number;
+		/** Max replay attempts per request before it is marked failed. */
+		maxAttempts: number;
+	};
 }
 
 export const DEFAULT_CONFIG: FeishuConfig = {
@@ -148,6 +161,13 @@ export const DEFAULT_CONFIG: FeishuConfig = {
 	workspaceRoot: "",
 	agentPreset: "ptc",
 	permissionMode: "danger-full-access",
+	replay: {
+		// GH #14: keep the existing zero-loss default (auto replay ON);
+		// opt out via /lark-config replay.auto=false or DSH_LARK_AUTO_REPLAY=0.
+		auto: true,
+		retentionMinutes: 30,
+		maxAttempts: 2,
+	},
 };
 
 /**
@@ -158,6 +178,18 @@ export const DEFAULT_CONFIG: FeishuConfig = {
  */
 export function normalizeAgentPreset(id: string): string {
 	return id === "code" ? "ptc" : id;
+}
+
+/**
+ * GH #14: env override for the BOOT-TIME automatic replay. Set
+ * `DSH_LARK_AUTO_REPLAY=0|false|no|off` to disable boot replay regardless of
+ * config, any other non-empty value to force it on; unset defers to
+ * `replay.auto`. Manual `/lark replay` is never gated by either.
+ */
+export function autoReplayEnabled(cfgAuto: boolean): boolean {
+	const raw = process.env.DSH_LARK_AUTO_REPLAY;
+	if (raw === undefined || raw.trim() === "") return cfgAuto;
+	return !/^(?:0|false|no|off)$/i.test(raw.trim());
 }
 
 /** DSH's shipped agent-presets roster (ids). Custom/user presets are extra. */
@@ -181,6 +213,7 @@ export const HOT_RELOADABLE: ReadonlyArray<keyof FeishuConfig> = [
 	"denyList",
 	"allowlist",
 	"attachments",
+	"replay",
 ];
 
 /**
@@ -229,7 +262,25 @@ export function buildHotReloadPatch(
 	return { [head]: { [nestedKey]: value } } as unknown as Partial<FeishuConfig>;
 }
 
-export function deepMerge<T>(base: T, over: Partial<T>): T {
+/**
+ * Partial config where OBJECT-valued keys accept recursive partial patches
+ * (`{ replay: { auto: false } }` keeps retentionMinutes/maxAttempts) while
+ * scalars and arrays are replaced whole (GH #14).
+ */
+export type DeepPartialConfig<T> = {
+	[K in keyof T]?: T[K] extends readonly unknown[]
+		? T[K]
+		: T[K] extends object
+			? DeepPartialConfig<T[K]>
+			: T[K];
+};
+
+export type FeishuConfigOverrides = DeepPartialConfig<FeishuConfig>;
+
+export function deepMerge<T>(
+	base: T,
+	over: DeepPartialConfig<T> | undefined,
+): T {
 	const out: Record<string, unknown> = { ...(base as Record<string, unknown>) };
 	for (const [k, v] of Object.entries(over ?? {})) {
 		if (v === undefined) continue;
@@ -253,10 +304,15 @@ export function deepMerge<T>(base: T, over: Partial<T>): T {
 	return out as T;
 }
 
+/**
+ * Partial config where OBJECT-valued keys accept partial patches
+ * (`{ replay: { auto: false } }` keeps retentionMinutes/maxAttempts) while
+ * scalars and arrays are replaced whole (GH #14).
+ */
 export interface ConfigStore {
 	get(): FeishuConfig;
 	/** Hot reload a whitelisted partial; returns the effective config. */
-	update(partial: Partial<FeishuConfig>): FeishuConfig;
+	update(partial: FeishuConfigOverrides): FeishuConfig;
 	/** Persist the current config to disk (for hot overrides). */
 	save(): void;
 	/** Persist overrides to the runtime-overrides.json. */
@@ -266,15 +322,15 @@ export interface ConfigStore {
 
 export function createConfigStore(
 	stateDir: string,
-	initialOverrides?: Partial<FeishuConfig>,
+	initialOverrides?: FeishuConfigOverrides,
 ): ConfigStore {
 	const overridesPath = join(stateDir, "runtime-overrides.json");
 	mkdirSync(dirname(overridesPath), { recursive: true });
 
-	let overrides: Partial<FeishuConfig> = { ...(initialOverrides ?? {}) };
+	let overrides: FeishuConfigOverrides = { ...(initialOverrides ?? {}) };
 	try {
 		const raw = readFileSync(overridesPath, "utf8");
-		const parsed = JSON.parse(raw) as Partial<FeishuConfig>;
+		const parsed = JSON.parse(raw) as FeishuConfigOverrides;
 		overrides = deepMerge(overrides, parsed);
 	} catch {
 		// first run — no overrides file yet
@@ -297,7 +353,7 @@ export function createConfigStore(
 					throw new Error(`config key "${key}" is not hot-reloadable`);
 				}
 			}
-			overrides = deepMerge(overrides, partial as Partial<FeishuConfig>);
+			overrides = deepMerge(overrides, partial);
 			return get();
 		},
 		save() {

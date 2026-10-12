@@ -16,7 +16,7 @@ import type { TaskCardSyncer } from "./task-card-syncer.ts";
 export type BridgeSessionEvent =
   | { type: "turn/start" }
   | { type: "assistant/chunk"; text: string }
-  | { type: "assistant/message"; text: string }
+  | { type: "assistant/message"; text: string; messageId?: string }
   | { type: "turn/end"; reason: string; finalText?: string }
   | { type: "tool/call"; name: string }
   | { type: "tool/result"; name: string; error?: { name: string; code: string } }
@@ -70,6 +70,8 @@ interface SessionState {
   lastFlushAt: number;
   /** True once any non-empty assistant text has been delivered this turn. */
   hasOutput: boolean;
+  /** True once the turn/end rescue has been issued (avoid duplicates). */
+  rescueIssued: boolean;
   /** True once markDone has been issued (avoid duplicates). */
   doneIssued: boolean;
 }
@@ -81,6 +83,7 @@ export function createEventForwarder(deps: EventForwarderDeps): EventForwarder {
     acc: "",
     lastFlushAt: Date.now(),
     hasOutput: false,
+    rescueIssued: false,
     doneIssued: false,
   });
 
@@ -104,6 +107,7 @@ export function createEventForwarder(deps: EventForwarderDeps): EventForwarder {
         // must not leak across turns — otherwise only the FIRST turn of a
         // session ever gets its DONE reaction (pi lesson: 每轮都要打 DONE).
         st.hasOutput = false;
+        st.rescueIssued = false;
         st.doneIssued = false;
         st.acc = "";
         st.stream = undefined;
@@ -148,7 +152,17 @@ export function createEventForwarder(deps: EventForwarderDeps): EventForwarder {
           }
         }
         await deps.outbox.enqueue({
-          dedupeKey: `${sessionKey}:assistant:${text.length}:${Date.now()}`,
+          // GH #15: key idempotency on DSH's stable AssistantMessage.id when
+          // available. The previous `text.length:Date.now()` key was UNIQUE
+          // on every enqueue, so a duplicated event delivery (leaked
+          // session/event subscription) produced two identical Feishu
+          // messages — and two different replies of equal length within the
+          // same millisecond could be wrongly collapsed instead. The
+          // Date.now() fallback only applies when messageId is absent
+          // (legacy mocks), preserving prior behavior there.
+          dedupeKey: event.messageId
+            ? `${sessionKey}:assistant:msg:${event.messageId}`
+            : `${sessionKey}:assistant:${text.length}:${Date.now()}`,
           laneKey: sessionKey,
           route: routeRefFor(route),
           kind: "assistant-output",
@@ -180,7 +194,11 @@ export function createEventForwarder(deps: EventForwarderDeps): EventForwarder {
         // also a SECOND, independent path to onDelivered (the inbound WAL no
         // longer depends solely on the assistant/message callback).
         const rescue = (event.finalText ?? "").trim() !== "" ? event.finalText : "";
-        if (!st.hasOutput && rescue && rescue !== "No response.") {
+        if (!st.hasOutput && !st.rescueIssued && rescue && rescue !== "No response.") {
+          // GH #15: claim the rescue BEFORE awaiting the enqueue — a
+          // duplicated turn/end delivery must never run two concurrent
+          // rescues (both would pass the hasOutput check and enqueue twice).
+          st.rescueIssued = true;
           try {
             await deps.outbox.enqueue({
               dedupeKey: `${sessionKey}:rescue:${rescue.length}:${Date.now()}`,

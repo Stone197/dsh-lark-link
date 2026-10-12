@@ -12,3 +12,11 @@
         groupPolicy: !!js "process.env.DSH_LARK_LINK_GROUP_POLICY ?? 'mention'"
         # denyList: exact command prefixes denied outright (no prompt, no card).
         denyList: []
+        # GH #14 inbound request replay: set auto:false to disable the
+        # boot-time automatic replay (pending requests stay in the WAL and can
+        # be dispatched on demand with /lark replay). Env override:
+        # DSH_LARK_AUTO_REPLAY=0.
+        # replay:
+        #   auto: true
+        #   retentionMinutes: 30
+        #   maxAttempts: 2

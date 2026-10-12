@@ -153,6 +153,13 @@ function toSessionEventOut(ev: SessionEvent): SessionEventOut | undefined {
 			return {
 				type: "assistant/message",
 				text: textOf(raw.data?.message?.content),
+				// GH #15: pass the stable AssistantMessage.id downstream — the
+				// outbound forwarder keys outbox idempotency on it, so a
+				// duplicated event delivery can't be sent twice.
+				messageId:
+					typeof raw.data?.message?.id === "string"
+						? raw.data.message.id
+						: undefined,
 			};
 		case "turn/end":
 			return { type: "turn/end", reason: raw.data?.reason?.kind ?? "done" };
@@ -1039,7 +1046,14 @@ export function createDshAdapter(deps: DshAdapterDeps): DshSessionBackend {
 				if (set) for (const fn of set) fn(out);
 			},
 		) ?? (() => {});
-		disposers.set(key, disp);
+		// GH #15: do NOT `disposers.set(key, disp)` here — the agent/error
+		// disposer below would OVERWRITE it in the plain Map, so handle
+		// dispose / rotate / releaseLiveSession / disposeIdle only ever
+		// unsubscribed `agent/error`. The `session/event` subscription lives
+		// on the long-lived plugin ctx (not the agent scope) and survived
+		// every agent rebuild: the same sessionId then had N live
+		// subscriptions and the forwarder enqueued one reply N times. Both
+		// disposers are composed into ONE entry right after registration.
 
 
 
@@ -1103,7 +1117,16 @@ export function createDshAdapter(deps: DshAdapterDeps): DshSessionBackend {
 				}
 			},
 		);
-		disposers.set(key, errDisp);
+		// GH #15: compose BOTH subscription disposers into a single entry —
+		// never overwrite one with the other.
+		disposers.set(key, () => {
+			try {
+				disp();
+			} catch {}
+			try {
+				errDisp();
+			} catch {}
+		});
 
 			return handle;
 		})();

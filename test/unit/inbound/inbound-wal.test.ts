@@ -69,7 +69,7 @@ test("old accepted records are excluded from replay after retention", () => {
   assert.equal(wal.markReplay("old1"), false);
 });
 
-test("prune removes delivered records and dead never-delivered ones", () => {
+test("prune removes delivered records; dead never-delivered ones become failed (GH #14)", () => {
   let t = 1_000_000;
   const dir = tmpdir();
   const wal = createInboundWal({
@@ -86,7 +86,85 @@ test("prune removes delivered records and dead never-delivered ones", () => {
   assert.equal(wal.pendingCount(), 2);
   t += 20_000;
   wal.prune();
+  // Delivered record aged out; the dead one is now a TERMINAL failed record —
+  // still inspectable (not silently deleted), no longer replayable.
+  assert.equal(wal.pendingCount(), 1);
+  assert.equal(wal.failedCount(), 1);
+  assert.equal(wal.pendingReplays().length, 0);
+  assert.equal(wal.list()[0]?.messageId, "p2");
+  assert.equal(wal.list()[0]?.state, "failed");
+});
+
+test("GH #14: out-of-window accepted records are terminal-marked failed by prune (no more limbo)", () => {
+  let t = 1_000_000;
+  const dir = tmpdir();
+  const wal = createInboundWal({
+    dir,
+    replayRetentionMs: 10_000,
+    maxReplayAttempts: 5,
+    now: () => t,
+  });
+  wal.accept(base("limbo")); // attempts=0 < cap, but soon out of window
+  t += 20_000;
+  // Before GH #14: pendingReplays()=0 (window) AND prune kept it forever —
+  // invisible in /status (neither pending nor failed). Now prune marks it.
+  wal.prune();
+  assert.equal(wal.pendingReplays().length, 0);
+  assert.equal(wal.failedCount(), 1, "limbo record surfaced as failed");
+  const rec = wal.list().find((r) => r.messageId === "limbo");
+  assert.equal(rec?.state, "failed");
+  assert.equal(rec?.failedAt, t, "failedAt stamped at prune time");
+});
+
+test("GH #14: failed records are deleted after failedRetentionMs", () => {
+  let t = 1_000_000;
+  const dir = tmpdir();
+  const wal = createInboundWal({
+    dir,
+    replayRetentionMs: 10_000,
+    failedRetentionMs: 100_000,
+    maxReplayAttempts: 5,
+    now: () => t,
+  });
+  wal.accept(base("gone"));
+  t += 20_000;
+  wal.prune(); // → failed, failedAt = 1_020_000
+  assert.equal(wal.failedCount(), 1);
+  t += 50_000;
+  wal.prune();
+  assert.equal(wal.failedCount(), 1, "still within failed retention");
+  t += 60_000; // failedAt + 110_000 > 100_000 retention
+  wal.prune();
+  assert.equal(wal.failedCount(), 0, "failed record aged out");
   assert.equal(wal.pendingCount(), 0);
+});
+
+test("GH #14: markReplay on an out-of-window record terminal-marks it failed", () => {
+  let t = 1_000_000;
+  const dir = tmpdir();
+  const wal = createInboundWal({
+    dir,
+    replayRetentionMs: 10_000,
+    now: () => t,
+  });
+  wal.accept(base("old1"));
+  t += 20_000; // age past the window
+  assert.equal(wal.pendingReplays().length, 0);
+  assert.equal(wal.markReplay("old1"), false);
+  assert.equal(wal.failedCount(), 1, "out-of-window record is failed, not accepted");
+});
+
+test("GH #14: remove drops a single stuck record (drop command backing)", () => {
+  const dir = tmpdir();
+  const wal = createInboundWal({ dir });
+  wal.accept(base("stuck"));
+  wal.prune();
+  wal.remove("stuck");
+  assert.equal(wal.pendingCount(), 0);
+  assert.equal(wal.list().length, 0);
+  // Removal persists: a fresh instance sees nothing.
+  const wal2 = createInboundWal({ dir });
+  assert.equal(wal2.pendingCount(), 0);
 });
 
 test("corrupt segment file does not crash load", () => {

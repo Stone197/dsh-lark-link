@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.5.6
+
+### Fix: 同一条 assistant 回复被投递两次 — 订阅泄漏 + 幂等键失效 (GH #15)
+
+飞书侧同一条回复收到两遍（间隔 1–2ms），outbox 里同文本出现两个仅 `dedupeKey` 毫秒时间戳不同的信封。两个独立根因，全部修复：
+
+- **`session/event` 订阅泄漏**：dsh-adapter 的 `disposers` 是普通 Map，`agent/error` 的退订函数会**覆盖**先注册的 `session/event` 退订函数。于是 `dispose()` / `rotateKey()` / `releaseLiveSession()` / `disposeIdle()` 只卸掉了 `agent/error`，而 `session/event` 监听注册在长生命周期插件 ctx 上、不随 agent 销毁——同一会话的 agent 一旦重建（resume / rotate / 空闲回收 / 桥重载），同一 sessionId 上就有多个 live 订阅，事件转发链对同一条 `assistant/message` 调用多次 `outbox.enqueue`。现在两个退订函数**组合成一条**再注册，任何销毁路径都完整退订。
+- **assistant 路径幂等键失效**：`dedupeKey` 含 `Date.now()`，每次入队必然不同，outbox 幂等对该路径完全失效（反向风险：长度相同 + 同毫秒的两条不同回复会被误去重）。现在 `assistant/message` 事件透传 DSH 的稳定 `AssistantMessage.id`，幂等键改为 `:assistant:msg:<messageId>`（messageId 缺失时才回落旧键）；turn/end rescue 增加 `rescueIssued` 前置守卫，并发的重复 turn/end 不再双发。
+
+### Feature: 入站请求补发开关 + WAL 记录全生命周期治理 (GH #14)
+
+- **启动自动补发可关**：新增 `replay` 配置组 `{ auto, retentionMinutes, maxAttempts }`（默认 `auto: true` 保持零丢失现状），支持 `/lark-config replay.auto=false` 热改、插件 config `replay.auto`、环境变量 `DSH_LARK_AUTO_REPLAY=0` 三种入口。关闭后待补发请求留在 WAL，随时 `/lark replay` 手动触发。
+- **`/lark replay` 子命令**：`replay`（立即补发，启动自动补发与手动触发走同一条代码路径）、`replay list`（查看 WAL 记录：状态/次数/文本）、`replay drop <messageId>`（丢弃卡住的记录）、`replay auto on|off`（切换开关）。
+- **消灭 WAL 记录“永久滞留”**：修复前 `state=accepted`、次数未达上限但已超 30 分钟窗口的记录**既不重放也不清理**，`/status` 也不统计。现在不变量为“每条记录要么可重放、要么终态 failed”：`prune()` 会把超窗/耗尽的记录标记为 `failed`（带 `failedAt`，在 `/status` 补发失败计数与 `replay list` 中可见），failed 记录保留 7 天后清理；`delivered` 记录仍按重放窗口清理。
+- **补发参数可配**：`replay.retentionMinutes` / `replay.maxAttempts` 在插件加载时生效（默认 30 / 2），不再写死。
+
+**Full Changelog**: https://github.com/amlyczz/dsh-lark-link/compare/v0.5.5...v0.5.6
+
 ## 0.5.5
 
 ### Feature: setup 持久化 user_info 并申请用户基本信息权限 (GH #12)

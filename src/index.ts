@@ -53,11 +53,13 @@ import {
 	HOT_RELOADABLE,
 	buildHotReloadPatch,
 	normalizeAgentPreset,
+	autoReplayEnabled,
 } from "./common/config.ts";
 import { createLogger, type Logger } from "./common/logger.ts";
 import { createDedupeStore } from "./common/dedupe-store.ts";
 import { createInboundWal } from "./inbound/inbound-wal.ts";
 import { createReplaySalvage } from "./inbound/replay-salvage.ts";
+import { createReplayRunner } from "./inbound/replay-runner.ts";
 import { createQuotaGovernor } from "./common/quota-governor.ts";
 import {
 	helpCard,
@@ -122,6 +124,12 @@ export interface LarkLinkConfig {
 	enabled?: boolean;
 	groupPolicy?: "open" | "mention" | "keywords" | "reply";
 	denyList?: string[];
+	/** GH #14: inbound request replay switches (see FeishuConfig.replay). */
+	replay?: {
+		auto?: boolean;
+		retentionMinutes?: number;
+		maxAttempts?: number;
+	};
 }
 
 /** Bridge state directory (<DSH_HOME>/lark-link, overridable). */
@@ -144,16 +152,23 @@ export function apply(ctx: Context, rawConfig: unknown): void {
 	const configStore = createConfigStore(dir, {
 		groupPolicy: cfg?.groupPolicy,
 		denyList: cfg?.denyList,
+		replay: cfg?.replay,
 	});
 	const status = createStatusStore(join(dir, "status.json"));
 	const routeStore = createRouteStore(join(dir, "routes.json"));
 	const dedupe = createDedupeStore(join(dir, "dedupe.jsonl"));
+	const getCfg = (): ReturnType<typeof configStore.get> => configStore.get();
 	// Durable inbound-request journal (入站请求补发). Records agent-bound text
 	// requests before enqueue; on boot, accepted-but-undelivered requests are
 	// re-dispatched so a crash/plugin-reload/dsh-restart mid-turn doesn't drop
-	// the user's message. Persists in <state>/inbound-wal/.
-	const inboundWal = createInboundWal({ dir: join(dir, "inbound-wal") });
-	const getCfg = (): ReturnType<typeof configStore.get> => configStore.get();
+	// the user's message. Persists in <state>/inbound-wal/. GH #14: the
+	// replay window / attempt cap are configurable (replay.retentionMinutes /
+	// replay.maxAttempts, read at plugin load — change via config + reload).
+	const inboundWal = createInboundWal({
+		dir: join(dir, "inbound-wal"),
+		replayRetentionMs: getCfg().replay.retentionMinutes * 60_000,
+		maxReplayAttempts: getCfg().replay.maxAttempts,
+	});
 	// Per-conversation overrides (workspace / model / preset). The bridge-level
 	// config stays the DEFAULT; /workspace, /model and /mode in one chat now
 	// scope to THAT chat only — other chats no longer follow the switch when
@@ -1598,8 +1613,9 @@ export function apply(ctx: Context, rawConfig: unknown): void {
 			}
 			case "lark": {
 				// Feishu-side /lark subcommands — same executor as the DSH command.
-				const sub = _rawInput.trim().split(/\s+/)[0] ?? "";
-				await durableReply(name, msg, await runLarkSubcommand(sub.toLowerCase()));
+				// GH #14: the FULL input is forwarded so subcommand arguments
+				// (/lark replay drop <id>) survive.
+				await durableReply(name, msg, await runLarkSubcommand(_rawInput.trim()));
 				return true;
 			}
 			default:
@@ -1880,6 +1896,32 @@ export function apply(ctx: Context, rawConfig: unknown): void {
 			join(tmpdir(), "dsh-lark-link", "inbound"),
 	});
 
+	// GH #14: shared replay routine — the boot-time automatic replay AND the
+	// manual `/lark replay` trigger run the exact same code path (salvage
+	// first, then compensated re-dispatch). Auto-gating (replay.auto /
+	// DSH_LARK_AUTO_REPLAY) is applied at the boot call site only.
+	const runInboundReplay = createReplayRunner({
+		wal: inboundWal,
+		salvage: (rec, sessionId) => replaySalvage.salvage(rec, sessionId),
+		activeSessionId: (sessionKey) =>
+			convCfg.get(sessionKey).activeSessionId,
+		redispatch: (rec) =>
+			messageHandler.handleCompensated({
+				messageId: rec.messageId,
+				chatId: rec.chatId,
+				chatType: rec.chatType,
+				chatMode: rec.chatType === "p2p" ? "p2p" : "group_all",
+				senderOpenId: rec.senderOpenId,
+				msgType: "text",
+				content: rec.text,
+				text: rec.text,
+				mentions: [],
+				timestamp: rec.acceptedAt,
+			}),
+		prune: () => inboundWal.prune(),
+		logger,
+	});
+
 	// ---- conversations / turn supervisor --------------------------------------
 	// Session keys whose in-flight turn has produced at least one deliverable
 	// assistant output. Used to detect SILENT turn failures (no reply): when a
@@ -2124,64 +2166,40 @@ export function apply(ctx: Context, rawConfig: unknown): void {
 		// attempt-capped (default 2) within a replay window (default 30 min), so a
 		// genuinely broken request can't loop forever. Fire-and-forget: never
 		// blocks bridge startup.
-		void (async () => {
-			let replayed = 0;
-			let salvaged = 0;
-			try {
-				inboundWal.prune();
-				for (const rec of inboundWal.pendingReplays()) {
-					if (!inboundWal.markReplay(rec.messageId)) continue;
-					// GH #9: the previous run may have COMPLETED the agent turn —
-					// the session log already holds the final assistant output and
-					// only the bridge event was lost. Answer from the log first;
-					// re-run the agent only when no usable output exists.
-					const sessionId = convCfg.get(rec.sessionKey).activeSessionId;
-					if (await replaySalvage.salvage(rec, sessionId)) {
-						salvaged++;
-						continue;
-					}
-					try {
-						await messageHandler.handleCompensated({
-							messageId: rec.messageId,
-							chatId: rec.chatId,
-							chatType: rec.chatType,
-							chatMode:
-								rec.chatType === "p2p" ? "p2p" : "group_all",
-							senderOpenId: rec.senderOpenId,
-							msgType: "text",
-							content: rec.text,
-							text: rec.text,
-							mentions: [],
-							timestamp: rec.acceptedAt,
-						});
-						replayed++;
-					} catch (err) {
-						logger.warn(
-							`inbound replay failed for ${rec.messageId}: ${
-								err instanceof Error ? err.message : String(err)
-							}`,
-						);
-					}
-				}
-				if (replayed > 0 || salvaged > 0)
-					logger.info(
-						`inbound replay: ${salvaged} answered from session logs, ${replayed} re-dispatched`,
+		// GH #14: the boot-time AUTO replay is now a switch — replay.auto
+		// (default true, /lark-config replay.auto=false) or the env override
+		// DSH_LARK_AUTO_REPLAY=0. When off, the requests stay in the WAL and
+		// can be replayed on demand via `/lark replay`.
+		if (autoReplayEnabled(getCfg().replay.auto)) {
+			void (async () => {
+				try {
+					const r = await runInboundReplay.run();
+					// Reflect the post-replay counts (requests that could not be
+					// immediately answered stay visible in /status for transparency;
+					// GH #9/#14: exhausted/out-of-window ones surface as failed
+					// instead of hiding in limbo).
+					status.refreshCounters({
+						inboundPending: r.pending,
+						inboundFailed: r.failed,
+					});
+				} catch (err) {
+					logger.warn(
+						`inbound replay errored: ${
+							err instanceof Error ? err.message : String(err)
+						}`,
 					);
-				// Reflect the post-replay counts (requests that could not be
-				// immediately answered stay visible in /status for transparency;
-				// GH #9: exhausted ones surface as failed instead of hiding).
-				status.refreshCounters({
-					inboundPending: inboundWal.pendingReplays().length,
-					inboundFailed: inboundWal.failedCount(),
-				});
-			} catch (err) {
-				logger.warn(
-					`inbound replay errored: ${
-						err instanceof Error ? err.message : String(err)
-					}`,
-				);
-			}
-		})();
+				}
+			})();
+		} else {
+			logger.info(
+				"inbound auto replay is OFF (replay.auto=false) — pending requests stay in the WAL; run /lark replay to dispatch manually",
+			);
+			inboundWal.prune(); // still housekeep: terminal-mark out-of-window records
+			status.refreshCounters({
+				inboundPending: inboundWal.pendingReplays().length,
+				inboundFailed: inboundWal.failedCount(),
+			});
+		}
 		logger.info("bridge started (in-process) [HMR-RELOAD-MARKER-2]");
 	};
 	const stopBridge = async (): Promise<void> => {
@@ -2338,10 +2356,59 @@ export function apply(ctx: Context, rawConfig: unknown): void {
 			}),
 		});
 	};
+	// GH #14: /lark replay — manual inbound-request replay + WAL inspection.
+	// Never gated by replay.auto (that switch only controls the BOOT trigger).
+	const runReplaySubcommand = async (args: string[]): Promise<string> => {
+		const op = (args[0] ?? "").toLowerCase();
+		if (op === "list") {
+			const recs = inboundWal.list();
+			if (recs.length === 0) return "WAL 为空：没有待补发或失败的入站请求";
+			const pending = inboundWal.pendingReplays().length;
+			const lines = recs
+				.slice(-20)
+				.map(
+					(r) =>
+						`[${r.state}] ×${r.attempts} ${new Date(r.acceptedAt).toISOString()} ${r.messageId} "${r.text.slice(0, 24)}"`,
+				);
+			return (
+				`WAL 共 ${recs.length} 条（待补发 ${pending} / 失败 ${inboundWal.failedCount()}）：\n` +
+				lines.join("\n")
+			);
+		}
+		if (op === "drop") {
+			const id = args[1];
+			if (!id)
+				return "用法：/lark replay drop <messageId>（先用 /lark replay list 查看记录）";
+			const exists = inboundWal.list().some((r) => r.messageId === id);
+			if (!exists) return `没有 messageId 为 ${id} 的 WAL 记录`;
+			inboundWal.remove(id);
+			return `已丢弃 ${id}`;
+		}
+		if (op === "auto") {
+			const val = (args[1] ?? "").toLowerCase();
+			if (val !== "on" && val !== "off") {
+				return `启动自动补发当前：${getCfg().replay.auto ? "开" : "关"}（用法：/lark replay auto on|off）`;
+			}
+			configStore.update({ replay: { auto: val === "on" } });
+			configStore.saveOverrides();
+			return `启动自动补发已${val === "on" ? "开启" : "关闭"}（下次启动生效；/lark replay 不受此开关影响）`;
+		}
+		// bare: replay now
+		const r = await runInboundReplay.run();
+		status.refreshCounters({
+			inboundPending: r.pending,
+			inboundFailed: r.failed,
+		});
+		return `补发完成：${r.salvaged} 条从会话日志救回，${r.replayed} 条重新分发，${r.skipped} 条跳过；剩余待补发 ${r.pending}，失败 ${r.failed}`;
+	};
+
 	// Shared /lark subcommand executor — used by the DSH command (/lark x) AND
 	// the Feishu-side route (/lark x in chat). startBridge/stopBridge/runSetup
 	// are resolved at call time (all initialized before any message arrives).
-	const runLarkSubcommand = async (sub: string): Promise<string> => {
+	const runLarkSubcommand = async (rawInput: string): Promise<string> => {
+		const tokens = rawInput.trim().split(/\s+/).filter(Boolean);
+		const sub = (tokens[0] ?? "").toLowerCase();
+		const rest = tokens.slice(1);
 		switch (sub) {
 			case "status":
 				return formatStatusLine(status.get());
@@ -2363,8 +2430,10 @@ export function apply(ctx: Context, rawConfig: unknown): void {
 				return await runSetup();
 			case "uninstall-clean":
 				return await runUninstallClean();
+			case "replay":
+				return await runReplaySubcommand(rest);
 			default:
-				return "Lark Link 用法：/lark setup | start | stop | restart | status | uninstall-clean";
+				return "Lark Link 用法：/lark setup | start | stop | restart | status | replay [list|drop <id>|auto on|off] | uninstall-clean";
 		}
 	};
 	// Single /lark command with subcommand dispatch (DSH command names can't
@@ -2372,10 +2441,9 @@ export function apply(ctx: Context, rawConfig: unknown): void {
 	// command 'lark' + input 'setup', not a 'lark setup' command).
 	registerCmd(
 		"lark",
-		"Lark Link bridge — usage: /lark setup|start|stop|restart|status|uninstall-clean",
-		async (rawInput) =>
-			runLarkSubcommand((rawInput.trim().split(/\s+/)[0] ?? "").toLowerCase()),
-		"setup|start|stop|restart|status|uninstall-clean",
+		"Lark Link bridge — usage: /lark setup|start|stop|restart|status|replay|uninstall-clean",
+		async (rawInput) => runLarkSubcommand(rawInput),
+		"setup|start|stop|restart|status|replay [list|drop <id>|auto on|off]|uninstall-clean",
 	);
 
 	/**
