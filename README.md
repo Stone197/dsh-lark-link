@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://cdn.jsdelivr.net/gh/amlyczz/dsh-lark-link@main/assets/mascot.png" alt="dsh-lark-link mascot" width="420"/>
+  <img src="https://cdn.jsdelivr.net/gh/amlyczz/dsh-lark-link@main/assets/logo.svg" alt="dsh-lark-link logo" width="360"/>
 </p>
 
 <h1 align="center">🪶 dsh-lark-link</h1>
@@ -11,7 +11,7 @@
 <p align="center">
   <a href="https://www.npmjs.com/package/dsh-lark-link"><img src="https://img.shields.io/npm/v/dsh-lark-link?color=cb3837&label=npm&logo=npm" alt="npm"/></a>
   <a href="https://github.com/amlyczz/dsh-lark-link/actions/workflows/ci.yml"><img src="https://github.com/amlyczz/dsh-lark-link/actions/workflows/ci.yml/badge.svg" alt="CI"/></a>
-  <img src="https://img.shields.io/badge/status-beta-orange" alt="beta"/>
+  <img src="https://img.shields.io/badge/status-stable-green" alt="stable"/>
   <img src="https://img.shields.io/badge/license-MIT-lightgrey" alt="MIT"/>
   <img src="https://img.shields.io/badge/node-%3E%3D24-green" alt="node"/>
 </p>
@@ -28,11 +28,13 @@
 - **零丢失**：出站 Outbox + 入站 WAL 双持久化，进程崩溃 / 插件热更 / dsh 重启，消息和回答都补得回来
 - **零学习成本**：所有切换类命令都是单选卡片，点一下即生效；DSH 原生命令（/goal /compact …）直接用
 - **真 Agent**：不是聊天机器人——bash/文件/子代理/工作流全套工具，飞书里跑完整 Harness
+- **统一控制台**：DSH 设置面板与插件详情页无缝复用专属控制台，四维监控、动态调控、无任何侧栏挤占
 
 ## ✨ 特性
 
 | 能力 | 说明 |
 | ---- | ---- |
+| 🎨 **官方品牌 Logo** | 原创设计的 Feather-Nexus 矢量微标（`assets/icon.svg` / `assets/logo.svg`），原生注入设置面板与包导出，极高视觉辨识度 |
 | 🎯 **一键认证** | `/lark setup` 扫码创建飞书应用（自动订阅消息事件 + 群聊全量 + 表情权限 + 用户基本信息），**30 秒上线**，无需手搓开放平台；也支持 `DSH_LARK_APP_ID/SECRET` 手动通道 |
 | 🧠 **多模式 Agent** | 标准 / PTC / 极简 / Cordis preset + 你在 GUI 自建的 preset，飞书发 `/mode` 出**单选卡片**即切（默认 PTC：一次执行多步工具调用，更快更省） |
 | 🎛 **权限分级** | 只读 / 工作区写 / **Full access** 三种权限，`/permission` 卡片即切；默认 Full access 全放行 |
@@ -40,17 +42,18 @@
 | 💬 **意图确认转发** | 模型提问（`ask_user_question`）→ **飞书意图确认卡片**（选项按钮 + 下拉多选 + 自定义输入），答完模型继续，飞书里完成完整交互闭环 |
 | 😊 **表情回执** | 收到消息随机表情"已收到"；回复完成 / 命令完成打 **DONE ✅**（只使用飞书实测有效 emoji） |
 | 💪 **出站零丢失** | 持久 Outbox（JSONL + at-least-once + 幂等键 + 分航道并行 + 失败离队不阻塞 + 周期清理），kill 重启自动续投；桥命令回复同样走 Outbox |
-| 🆕 **入站请求补发** | Agent **处理到一半**插件/dsh 崩溃/重启，重启后自动重新触发这条用户消息（不再静默丢请求）——Inbound WAL 持久化 + 启动对账 + 次数上限/时间窗防空转；`/status` 显示待补发条数。**可关**：`/lark-config replay.auto=false`（或 `DSH_LARK_AUTO_REPLAY=0`）后改为 `/lark replay` 手动触发；超窗/耗尽的记录标记 failed 并可 `replay drop` 丢弃 |
+| 📥 **入站请求补发** | Agent **处理到一半**插件/dsh 崩溃/重启，重启后自动重新触发这条用户消息（不再静默丢请求）——Inbound WAL 持久化 + 原子快照压实 + 启动对账 + 次数上限/时间窗防空转；支持 `/lark replay` 手动触发与 `replay drop` 丢弃 |
 | 🛡 **连接自愈** | probe 驱动受控重连 + QuotaGovernor 配额熔断（窗口过期**自动解除、自动重连**）+ 断连补偿；环境代理自动规避 |
+| 🔒 **四级脱敏与 UTF-8 守护** | 敏感密钥（Bearer/sk-/app_secret/t-token 等）全链路自动脱敏；UTF-8 字符字节预算有界截断，杜绝卡片越界报错与乱码 |
 | 🔀 **命令三级分流** | 桥特有命令桥处理；DSH 注册命令原生执行；`/goal`、未知 `/xxx`、普通消息原样注入 Agent（无拦截无门禁）；**skill 无前缀**——直接描述任务，模型自动加载 |
 | 📎 **入站多媒体** | 飞书图片 → **视觉模型看图**（attachment 存储）；文件 → 有界文本提取进提示词 |
 | 📤 **出站多媒体** | 模型经 `lark_send_local_file` 主动回传本地图片/文件（工作区白名单 + 大小校验 + 格式自动降级） |
 | 🩺 **一键诊断** | `/doctor` → **ZIP 诊断包**（含当前会话完整 DSH session log + 脱敏配置 + ISSUE.md），发回飞书，贴给 AI 即可定位 |
 | ✍️ **Markdown 渲染** | 回复自动检测 markdown → **CardKit 卡片**渲染（标题/列表/代码块/表格），纯文本走文本消息 |
 | 🌊 **可选流式输出** | `/lark-config streaming.enabled=true` 热开 CardKit schema 2.0 流式卡片，逐字打印（默认关，省流量） |
-| 🆕 **长任务目标驱动** | `/goal <目标>` 直接在飞书启动自主长任务闭环；支持 `/goal pause`（暂停）、`/goal resume`（继续）、`/goal clear`（清除）；纯文本自然对话交互，告别冗余看板干扰 |
-| 🆕 **会话管理与恢复** | `/new` 当前工作区新起会话；`/resume` 极简卡片恢复历史会话（点选/序号/id 前缀，自动提取会话真实标题，彻底解决跨重启 live session 冲突）；`/workspace <路径>` 切换工作区；按会话完全独立持久化工作区/模型/模式 |
-| 🖥 **复用 DSH Web GUI** | 桥 Agent = 原生 DSH session，聊天/流式/工具卡/设置全由 GUI 呈现；会话自动归入对应工作区（不再"未分组"）；Web 面板实时显示 Outbox/补发计数 |
+| 🎯 **长任务目标驱动** | `/goal <目标>` 直接在飞书启动自主长任务闭环；支持 `/goal pause`（暂停）、`/goal resume`（继续）、`/goal clear`（清除）；纯文本自然对话交互 |
+| 🔄 **会话管理与恢复** | `/new` 当前工作区新起会话；`/resume` 极简卡片恢复历史会话（点选/序号/id 前缀，自动提取会话真实标题，彻底解决跨重启 live session 冲突）；`/workspace <路径>` 切换工作区；按会话完全独立持久化工作区/模型/模式 |
+| 🖥 **复用 DSH Web GUI** | 彻底干掉侧边栏图标（零挤占变形），**设置页（settings.section）与插件详情页（plugins.bundle.config）复用统一高保真管理控制台**：包含 4 维监控卡片、一键扫码配置（QR 自动刷新）、实时运行时策略调整（免 @/预设/权限/补发开关）、常用命令速查与全功能 Web 操作接口 |
 | 👥 **访问控制** | `allowlist` 限定可对话的 open_id 白名单；`groupPolicy` 群聊触发策略（open / mention / keywords / reply）；`denyList` 命令前缀拒绝兜底 |
 | 🔓 **默认 Full access** | 沙箱全访问 + 审批 never，零打扰 |
 

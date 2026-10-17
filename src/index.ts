@@ -377,17 +377,67 @@ export function apply(ctx: Context, rawConfig: unknown): void {
 							writeHead(s: number, h: Record<string, string>): unknown;
 							end(body?: unknown): unknown;
 						};
-						const configured = Boolean(
-							await resolveCredentials(credStore, getCfg().credentialRef),
-						);
+						const cfg = getCfg();
+						const creds = await resolveCredentials(credStore, cfg.credentialRef);
+						const configured = Boolean(creds);
 						r.writeHead(200, {
 							"Content-Type": "application/json; charset=utf-8",
 							"Cache-Control": "no-store",
 						});
-						r.end(JSON.stringify({ ...status.get(), configured }));
+						r.end(
+							JSON.stringify({
+								...status.get(),
+								configured,
+								config: {
+									appId: creds?.appId || "",
+									groupPolicy: cfg.groupPolicy || "mention",
+									agentPreset: cfg.agentPreset || "ptc",
+									permissionMode: cfg.permissionMode || "full",
+									replay: cfg.replay ?? {
+										auto: true,
+										retentionMinutes: 30,
+										maxAttempts: 2,
+									},
+								},
+							}),
+						);
 					},
 				}),
 			"lark-link: webui status route",
+		);
+		ctx.effect(
+			() =>
+				webServer.register({
+					kind: "exact",
+					path: "/plugins/lark-link/icon.svg",
+					handler: (_req, res) => {
+						const r = res as {
+							writeHead(s: number, h: Record<string, string>): unknown;
+							end(body?: unknown): unknown;
+						};
+						try {
+							const candidates = [
+								join(process.cwd(), "assets/icon.svg"),
+								join(process.cwd(), "icon.svg"),
+								join(process.cwd(), "node_modules/dsh-lark-link/assets/icon.svg"),
+								join(homedir(), ".dsh/plugins/dsh-lark-link/assets/icon.svg"),
+							];
+							for (const cand of candidates) {
+								if (existsSync(cand)) {
+									r.writeHead(200, {
+										"Content-Type": "image/svg+xml; charset=utf-8",
+										"Cache-Control": "public, max-age=86400",
+									});
+									r.end(readFileSync(cand, "utf8"));
+									return;
+								}
+							}
+						} catch {}
+						r.writeHead(404, { "Content-Type": "text/plain" });
+						r.end("icon not found");
+					},
+				}),
+			"lark-link: webui icon route",
 		);
 	}
 
@@ -2445,6 +2495,66 @@ export function apply(ctx: Context, rawConfig: unknown): void {
 		async (rawInput) => runLarkSubcommand(rawInput),
 		"setup|start|stop|restart|status|replay [list|drop <id>|auto on|off]|uninstall-clean",
 	);
+
+	if (webServer) {
+		ctx.effect(
+			() =>
+				webServer.register({
+					kind: "exact",
+					path: "/plugins/lark-link/action",
+					handler: async (req, res) => {
+						const r = res as {
+							writeHead(s: number, h: Record<string, string>): unknown;
+							end(body?: unknown): unknown;
+						};
+						try {
+							let bodyText = "";
+							const rReq = req as { on?(e: string, fn: (c: unknown) => void): void };
+							if (rReq && typeof rReq.on === "function") {
+								await new Promise<void>((resolve) => {
+									rReq.on!("data", (chunk: unknown) => {
+										bodyText += String(chunk);
+									});
+									rReq.on!("end", () => resolve());
+								});
+							}
+							const body = bodyText
+								? (JSON.parse(bodyText) as Record<string, unknown>)
+								: {};
+							const action = String(body.action ?? "").trim();
+							if (action === "updateConfig" && body.config) {
+								configStore.update(body.config as Record<string, unknown>);
+								configStore.saveOverrides();
+								r.writeHead(200, {
+									"Content-Type": "application/json; charset=utf-8",
+									"Cache-Control": "no-store",
+								});
+								r.end(JSON.stringify({ ok: true, message: "配置已更新" }));
+								return;
+							}
+							const msg = await runLarkSubcommand(action);
+							r.writeHead(200, {
+								"Content-Type": "application/json; charset=utf-8",
+								"Cache-Control": "no-store",
+							});
+							r.end(JSON.stringify({ ok: true, message: msg }));
+						} catch (err: unknown) {
+							r.writeHead(500, {
+								"Content-Type": "application/json; charset=utf-8",
+								"Cache-Control": "no-store",
+							});
+							r.end(
+								JSON.stringify({
+									ok: false,
+									error: String((err as Error)?.message ?? err),
+								}),
+							);
+						}
+					},
+				}),
+			"lark-link: webui action route",
+		);
+	}
 
 	/**
 	 * Locate the DSH session log for a bridge session id. Persisted logs live

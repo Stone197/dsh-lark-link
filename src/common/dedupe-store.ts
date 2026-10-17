@@ -4,6 +4,7 @@
 
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
 import type { DedupeRecord } from "./types.ts";
 
 export interface DedupeStore {
@@ -96,5 +97,5 @@ export function acquireDirLock(
 
 /** Temp-dir helper for tests. */
 export function tempDir(prefix: string): string {
-  return mkdtempSync(join(process.env.TMPDIR ?? "/tmp", prefix));
+  return mkdtempSync(join(process.env.TMPDIR ?? tmpdir(), prefix));
 }

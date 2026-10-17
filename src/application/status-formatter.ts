@@ -40,13 +40,36 @@ export function statusDetailLines(s: BridgeStatus): string[] {
 }
 
 /** Mask secrets in a diagnostics dump (config/credentials redaction). */
-export function redactSecrets(input: string, secrets: string[]): string {
+export function redactSecrets(input: string, secrets: string[] = []): string {
   let out = input;
   for (const secret of secrets) {
-    if (!secret) continue; // explicitly-listed secrets are masked regardless of length
+    if (!secret || secret.length < 3) continue;
     out = out.split(secret).join("***");
   }
-  // Mask anything that looks like an appSecret (32-char base64-ish).
+  // 1. Authorization Bearer tokens
+  out = out.replace(/(Bearer\s+)[A-Za-z0-9_\-\.]{12,}/gi, "$1***");
+  // 2. Secret assignments: app_secret, encrypt_key, api_key, token, password, etc.
+  out = out.replace(
+    /(["']?(?:app_?secret|encrypt_?key|verification_?token|access_?token|api_?key|secret|token|password)["']?\s*[:=]\s*["']?)[^\s"',;}{]{8,}(["']?)/gi,
+    "$1***$2",
+  );
+  // 3. Provider keys: sk-...
+  out = out.replace(/\bsk-[A-Za-z0-9_\-]{16,}\b/g, "sk-***");
+  // 4. Feishu tokens: t-... or u-...
+  out = out.replace(/\b(?:t|u)-[A-Za-z0-9_\-]{20,}\b/g, "***");
+  // 5. Generic 32+ hex/base64-ish tokens
   out = out.replace(/\b[0-9A-Za-z_\-]{32,}\b/g, "***");
   return out;
+}
+
+/**
+ * Truncate a string to fit within maxBytes of UTF-8 encoding without splitting
+ * multi-byte characters or surrogate pairs (e.g. emojis / CJK characters).
+ */
+export function boundedUtf8String(str: string, maxBytes: number): string {
+  const buf = Buffer.from(str, "utf8");
+  if (buf.length <= maxBytes) return str;
+  let truncated = buf.subarray(0, maxBytes).toString("utf8");
+  truncated = truncated.replace(/\uFFFD+$/, "");
+  return truncated;
 }

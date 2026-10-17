@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { resolve } from "node:path";
 import {
 	resolveWorkspaceTarget,
 	resolveInWorkspacePath,
@@ -10,12 +11,12 @@ import {
 
 test("paths: posix absolute arg stays absolute", () => {
 	const t = resolveWorkspaceTarget("/data/proj", "/cur/ws");
-	assert.equal(t, "/data/proj");
+	assert.equal(t, resolve("/data/proj"));
 });
 
 test("paths: relative arg joins the current workspace", () => {
 	const t = resolveWorkspaceTarget("sub/dir", "/cur/ws");
-	assert.equal(t, "/cur/ws/sub/dir");
+	assert.equal(t, resolve("/cur/ws/sub/dir"));
 });
 
 test("paths: ~ expands to homedir", () => {
@@ -48,13 +49,13 @@ test("paths: UNC path is absolute", () => {
 
 test("paths: absolute input inside root resolves and passes containment", () => {
 	const { abs, ok } = resolveInWorkspacePath("/ws/a/b.txt", "/ws/a");
-	assert.equal(abs, "/ws/a/b.txt");
+	assert.equal(abs, resolve("/ws/a/b.txt"));
 	assert.equal(ok, true);
 });
 
 test("paths: relative input resolves against the root", () => {
 	const { abs, ok } = resolveInWorkspacePath("b.txt", "/ws/a");
-	assert.equal(abs, "/ws/a/b.txt");
+	assert.equal(abs, resolve("/ws/a/b.txt"));
 	assert.equal(ok, true);
 });
 

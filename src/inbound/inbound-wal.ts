@@ -132,11 +132,29 @@ export function createInboundWal(deps: InboundWalDeps): InboundWal {
 
   function persistAll(): void {
     try {
-      const segFile = join(dir, `seg-${Date.now()}.jsonl`);
+      const segFile = join(
+        dir,
+        `seg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.jsonl`,
+      );
       const tmp = `${segFile}.tmp`;
       const lines = [...records.values()].map((r) => JSON.stringify(r));
       writeFileSync(tmp, lines.join("\n") + "\n", { mode: 0o600 });
+      let oldSegs: string[] = [];
+      try {
+        oldSegs = readdirSync(dir).filter((f) => /^seg-.*\.jsonl$/.test(f));
+      } catch {
+        oldSegs = [];
+      }
       renameSync(tmp, segFile);
+      for (const old of oldSegs) {
+        if (old !== basename(segFile)) {
+          try {
+            rmSync(join(dir, old), { force: true });
+          } catch {
+            // best-effort cleanup
+          }
+        }
+      }
     } catch {
       // best-effort persistence; in-memory continues
     }

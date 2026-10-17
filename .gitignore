@@ -31,3 +31,6 @@ research/
 .*.tmp.mjs
 .tmp*/
 
+pnpm-lock.yaml
+pnpm-workspace.yaml
+

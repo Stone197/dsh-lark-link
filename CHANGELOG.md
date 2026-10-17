@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.6.0
+
+### Feature: 设置页与插件详情页复用统一控制台 & 移除侧边栏图标
+
+- **干掉左侧侧栏图标**：移除 `sidebar.footer.action` 挂载点，彻底避免与其它插件（如 `dsh-cost-meter`）在侧栏底部争抢槽位、变形和挤占空间的问题。
+- **设置页与插件详情页统一控制台**：
+  - 注入 `settings.section`（DSH 设置面板 -> `Lark / 飞书`）以及 `plugins.bundle.config` / `plugins.row.config`（插件详情与行配置），100% 界面与功能复用，零冗余。
+  - 控制台全面升级：四维监控卡片（长连接状态、零丢失 Outbox 队列、入站 WAL 补发、活跃会话数）、一键扫码配置（带 QR 码平滑刷新）、实时运行时策略热调整（群聊免 @ 策略、智能体 Preset、权限模式、入站自动补发开关）、常用斜杠命令速查、操作反馈 Toast、全功能 Web 操作接口（`/plugins/lark-link/action` 与 `/plugins/lark-link/status`）。
+- **全新品牌 Logo 与图标系统**：
+  - 原创设计并绘制了 `dsh-lark-link` 官方矢量 SVG 图标（`assets/icon.svg`、`icon.svg`、`assets/logo.svg`），融合飞书/Lark 展翅青羽与 DeepSeek 智能神经桥接光环。
+  - 配置 `package.json` 的 `"icon"` 属性与 `"./icon"`、`"./icon.svg"` 导出，在 DSH Web GUI 控制台与设置面板中原生矢量高保真渲染。
+
+### Fix: 入站 WAL 记录全生命周期压实与防复活修复
+
+- 修复了此前 `persistAll()` 仅追加 `seg-*.jsonl` 未清理旧分片，导致被 `remove()` 或 `prune()` 丢弃的卡住请求在重启/重载时被旧分片重新加载（resurrection）的深层隐患。现在 `persistAll()` 实现原子快照写入并自动清理旧分片。
+
+### Fix: 跨平台与 Windows 兼容性修复
+
+- 修复 `tempDir` 在 Windows 环境下因硬编码 `/tmp` 导致 `ENOENT` 的问题，统一回退至 `node:os` 的 `tmpdir()`。
+- 修复 Windows NTFS 文件系统缺乏 POSIX 0600 mode 校验报错。
+- 修复 `paths.test.ts` 跨盘符路径断言。
+
+### Security: 四级脱敏与 UTF-8 安全字节截断
+
+- 吸取 `dsh-lark-bridge` 的工程实践，全面增强 `redactSecrets`，覆盖 Bearer Token、sk- 模型提供商密钥、app_secret/encrypt_key 赋值、飞书 t-/u- 凭证等全方位敏感数据脱敏。
+- 新增 `boundedUtf8String` 字节预算安全截断，防止分割多字节字符或代理对引起乱码或飞书消息卡片报错。
+
+**Full Changelog**: https://github.com/amlyczz/dsh-lark-link/compare/v0.5.6...v0.6.0
+
 ## 0.5.6
 
 ### Fix: 同一条 assistant 回复被投递两次 — 订阅泄漏 + 幂等键失效 (GH #15)

@@ -236,5 +236,9 @@ test("persisted file uses 0600 mode", () => {
   const last = segs[segs.length - 1];
   assert.ok(last !== undefined);
   const mode = statSync(join(dir, last)).mode & 0o777;
-  assert.equal(mode, 0o600);
+  if (process.platform !== "win32") {
+    assert.equal(mode, 0o600);
+  } else {
+    assert.ok(mode !== 0);
+  }
 });
