@@ -24,10 +24,10 @@ export interface FeishuConfig {
 		/**
 		 * Run-card mode (bridge interaction parity): one live CardKit card per
 		 * turn that folds reasoning + tool-call panels + footer + summary and
-		 * carries the ⏹ stop button. Default ON — it is the signature UX of
-		 * this release; opt out with `/lark-config streaming.runCard=false`.
-		 * When CardKit is unavailable the forwarder falls back to the durable
-		 * outbox, so enabling it never loses content.
+		 * carries the ⏹ stop button. OPT-IN (default OFF) so the classic reply
+		 * box stays the primary interaction; enable with
+		 * `/lark-config streaming.runCard=true`. When CardKit is unavailable
+		 * the forwarder falls back to the durable outbox.
 		 */
 		runCard: boolean;
 		printFrequencyMs: number;
@@ -141,17 +141,18 @@ export const DEFAULT_CONFIG: FeishuConfig = {
 		// Default OFF (省流量): 每轮输出直发完整回复，流式卡作为可选增强
 		// (pi 31dc3c9 用户决策)。/lark-config streaming.enabled=true 热改开启。
 		enabled: false,
-		// Interaction parity (bridge): one live run card per turn, DEFAULT ON.
-		// It is independent from `enabled` (legacy text streaming): the run
-		// card is the released feature; set false to fall back to plain text.
-		runCard: true,
+		// Interaction parity (bridge): one live run card per turn. OPT-IN
+		// (default OFF) — the classic reply box stays primary; enable with
+		// `/lark-config streaming.runCard=true`.
+		runCard: false,
 		printFrequencyMs: 120,
 		printStep: 3,
 	},
 	inboundMerge: {
-		// Bridge parity: merge consecutive text messages into one turn
-		// (600ms in the reference bridge; 1000ms here for slower mobile typing).
-		enabled: true,
+		// OPT-IN message debounce (merge consecutive text messages into one
+		// turn). Default OFF keeps one-message-one-turn; enable with
+		// `/lark-config inboundMerge.enabled=true`.
+		enabled: false,
 		silenceMs: 1000,
 	},
 	reactions: {

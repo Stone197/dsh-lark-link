@@ -6,7 +6,6 @@
 // emoji 精简为稳定集合（部分 emoji 在部分客户端字体渲染乱码）。
 
 import type { AgentPresetOption } from "../common/types.ts";
-import { feishuHelpCatalog } from "../help/catalog.ts";
 
 export type CardVariant = "status" | "help" | "setup" | "welcome" | "error";
 
@@ -409,35 +408,32 @@ export function resumeCard(
 }
 
 /**
- * `/help` — generated from the unified catalog (`src/help/catalog.ts`,
- * Feishu view), so the card and the WeChat listing can never disagree.
- *
- * Buttons reuse the EXISTING card-action path: each `op` is the bare bridge
- * command the router already dispatches (`status`, `workspace`, `mode`,
- * `doctor`), so a click lands in `bridgeHandler` exactly like typing the
- * command. No new callback surface is introduced here.
+ * `/help` — the classic text listing (unchanged interaction), with the new
+ * `/cd` / `/ws` commands appended. New visuals (button cards etc.) are opt-in
+ * features elsewhere; the primary interaction stays exactly as before.
  */
 export function helpCard(): unknown {
-	const catalog = feishuHelpCatalog();
-	const lines: string[] = ["**可用命令**（点按钮或直接输入）", ""];
-	for (const group of catalog.groups) {
-		const entries = catalog.commands.filter((entry) => entry.group === group.id);
-		if (entries.length === 0) continue;
-		lines.push(`**${group.title}**`);
-		for (const entry of entries) {
-			lines.push(`- \`${entry.command}\` ${entry.summary}`);
-		}
-		lines.push("");
-	}
-	lines.push(catalog.footer);
-	return withButtons(
-		markdownCard(lines.join("\n"), { header: "Lark Link 帮助", accent: true }),
+	return markdownCard(
 		[
-			button("桥接状态", { op: "status" }),
-			button("工作区", { op: "workspace" }),
-			button("切换模式", { op: "mode" }),
-			button("诊断包", { op: "doctor" }),
-		],
+			"**可用命令**（点按钮或直接输入）",
+			"",
+			"- `/status` 桥接状态",
+			"- `/mode` 切换 Agent 模式（标准/PTC/极简/创造）",
+			"- `/permission` 切换权限（只读/工作区写/Full access）",
+			"- `/new` 当前工作区新起会话",
+			"- `/resume` 恢复当前工作区的历史会话",
+			"- `/workspace <路径>` 切换工作区（`~` 可用）",
+			"- `/cd <路径>` 切换工作区（同 `/workspace`）",
+			"- `/ws` 收藏工作空间：`list` / `add` / `use` / `remove` / `status`",
+			"- `/stop` 停止当前会话任务",
+			"- `/doctor` 生成诊断包（含 session log）",
+			"- `/model` 查看/切换模型",
+			"- `/lark-config k=v` 热改配置（嵌套键如 `streaming.runCard=true`）",
+			"- `/lark setup|start|stop|status` 桥接管理",
+			"- `/goal` 等 DSH 命令原样执行",
+			"- skill 无需前缀：直接说任务（如「用 X skill 做 Y」）",
+		].join("\n"),
+		{ header: "Lark Link 帮助", accent: true },
 	);
 }
 

@@ -84,6 +84,7 @@ import {
 import type { GoalSnapshotState, TodoItemState } from "./common/types.ts";
 import { createTaskCardSyncer, type TaskCardSyncer } from "./outbound/task-card-syncer.ts";
 import { applyWechatChannel, type WechatChannelConfig } from "./wechat/index.ts";
+import { detectDefaultWorkspaceRoot } from "./common/workspace-default.ts";
 
 
 
@@ -128,6 +129,8 @@ export interface LarkLinkConfig {
 	enabled?: boolean;
 	groupPolicy?: "open" | "mention" | "keywords" | "reply";
 	denyList?: string[];
+	/** Initial workspace root override (empty = detect the GUI's workspace). */
+	workspaceRoot?: string;
 	/** GH #14: inbound request replay switches (see FeishuConfig.replay). */
 	replay?: {
 		auto?: boolean;
@@ -171,10 +174,18 @@ export function apply(ctx: Context, rawConfig: unknown): void {
 	const logger: Logger = createLogger("lark-link");
 
 	// ---- config / status / stores -------------------------------------------
+	// Default workspace = the one the GUI is currently using. A desktop DSH
+	// process runs with cwd = the PROFILE directory, which is not a GUI
+	// workspace; sessions created there never show up in the conversation list.
+	const defaultWorkspaceRoot =
+		cfg && "workspaceRoot" in cfg && typeof cfg.workspaceRoot === "string"
+			? cfg.workspaceRoot
+			: detectDefaultWorkspaceRoot();
 	const configStore = createConfigStore(dir, {
 		groupPolicy: cfg?.groupPolicy,
 		denyList: cfg?.denyList,
 		replay: cfg?.replay,
+		...(defaultWorkspaceRoot ? { workspaceRoot: defaultWorkspaceRoot } : {}),
 	});
 	const status = createStatusStore(join(dir, "status.json"));
 	const routeStore = createRouteStore(join(dir, "routes.json"));
@@ -415,6 +426,7 @@ export function apply(ctx: Context, rawConfig: unknown): void {
 									groupPolicy: cfg.groupPolicy || "mention",
 									agentPreset: cfg.agentPreset || "ptc",
 									permissionMode: cfg.permissionMode || "full",
+									workspaceRoot: cfg.workspaceRoot || "",
 									replay: cfg.replay ?? {
 										auto: true,
 										retentionMinutes: 30,
@@ -1045,11 +1057,15 @@ export function apply(ctx: Context, rawConfig: unknown): void {
 	): Promise<boolean> => {
 		switch (name) {
 			case "status": {
-				const st = status.get();
-				const statusText = formatStatusLine(st);
-				const statusDetails = statusDetailLines(st);
-				const plain = statusText + "\n\n" + statusDetails.join("\n");
-				await durableReply(name, msg, statusCard(statusText, statusDetails), plain);
+				// Classic text status (the original interaction). Buttons for the
+				// same commands live in /help; keep this familiar.
+				await durableReply(
+					name,
+					msg,
+					formatStatusLine(status.get()) +
+						"\n\n" +
+						statusDetailLines(status.get()).join("\n"),
+				);
 				return true;
 			}
 			case "feishu-config":

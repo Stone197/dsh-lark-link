@@ -153,8 +153,8 @@ test("config: autoReplayEnabled honors env DSH_LARK_AUTO_REPLAY over config", as
 
 // ---- inbound merge (防抖合并) ------------------------------------------------
 
-test("config: inboundMerge defaults to enabled with a 1000ms quiet window", () => {
-	assert.deepEqual(DEFAULT_CONFIG.inboundMerge, { enabled: true, silenceMs: 1000 });
+test("config: inboundMerge is opt-in (disabled by default) with a 1000ms quiet window", () => {
+	assert.deepEqual(DEFAULT_CONFIG.inboundMerge, { enabled: false, silenceMs: 1000 });
 	assert.ok(
 		HOT_RELOADABLE.includes("inboundMerge"),
 		"inboundMerge is hot-reloadable",

@@ -12,11 +12,11 @@
 - **>3 工具自动折叠**：历史调用折叠为「☕ N 个工具调用（已结束）」，运行中始终保留最新一条展开。
 - **流式摘要 + footer 状态**：思考中 / 正在调用工具 / 正在输出 / 已完成；卡片摘要同步。
 - **卡片内 ⏹ 终止**：HMAC-SHA256 签名（TTL + sessionKey/chatId 绑定 + 一次性 nonce 防重放），`handleCardAction` 验签后才执行停止。
-- **配置**：`streaming.runCard`（默认 **true**）；CardKit 不可用时自动回退。旧 `streaming.enabled`（单 markdown 流式）保留且独立。
+- **配置**：`streaming.runCard`（默认 **false**，opt-in；`/lark-config streaming.runCard=true` 开启）；CardKit 不可用时自动回退。旧 `streaming.enabled`（单 markdown 流式）保留且独立。
 
 ### Feature: 入站防抖合并（飞书）
 
-- 同会话 1 秒静默窗口内的连续文本合并为一轮（`inboundMerge.enabled` / `inboundMerge.silenceMs`），Agent 运行中消息继续排队；命令与媒体消息直通。
+- 同会话 1 秒静默窗口内的连续文本合并为一轮（`inboundMerge.enabled` 默认 **false**，opt-in；`inboundMerge.silenceMs`），Agent 运行中消息继续排队；命令与媒体消息直通。
 - WAL 只接受合并后的一条请求（messageId=最后一条、text=合并文本），`onDelivered` 语义保持不变。
 
 ### Feature: 微信通道（移植自 pan17/dsh-wechat 0.13.3，MIT）
@@ -38,6 +38,9 @@
 - `/ws list|add|use|remove|status`：收藏工作空间持久化到 `~/.dsh/lark-link/workspaces.json`（原子写 0600），`/ws list` 返回可点按钮卡片，`use` 同时更新会话工作区。
 
 ### Fix
+
+- **保持原版交互**：`/help` 恢复原版文本清单（仅追加 `/cd` `/ws` 两行）；`/status` 恢复原版文本回复；运行卡片与防抖合并改为 opt-in，默认行为与此前一致。
+- **会话默认工作区**：桥会话默认落到 GUI 当前使用的工作区（读 `<DSH_HOME>/storages/workspace.json`），不再使用桌面进程 cwd（profile 目录），新会话能在 GUI 会话列表里看到。
 
 - `cordis.patch.yml` 以字符串插值环境变量，`DSH_WECHAT_ENABLED=0` 会以 `"0"` 传入并被当成真值。新增 `flagOff()` 统一识别 `false/0/no/off`，插件级与微信级开关都能被环境变量正确关闭（临时实例验证：关闭后 `/wechat/api/status` 404，飞书引擎与客户端 bundle 正常）。
 

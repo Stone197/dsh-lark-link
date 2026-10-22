@@ -272,18 +272,15 @@ function buttonValues(card: unknown): Array<Record<string, unknown>> {
 	);
 }
 
-test("/help 卡片由统一帮助目录生成，并带可点按钮（回调复用现有 op）", () => {
+test("/help 保持原版文本清单，仅新增 /cd /ws 说明", () => {
 	const card = helpCard() as Json;
 	assert.equal(card.schema, "2.0");
-	// Wording comes from src/help/catalog.ts (Feishu view): the new commands
-	// must be discoverable from the card, not only from WeChat.
-	const body = card.body as Json;
-	const text = JSON.stringify(body);
-	for (const command of ["/lark", "/ws", "/cd", "/goal", "/doctor", "/lark-config", "/sessions"]) {
+	const text = JSON.stringify(card.body as Json);
+	for (const command of ["/lark", "/ws", "/cd", "/goal", "/doctor", "/lark-config", "/model", "/status"]) {
 		assert.ok(text.includes(command), `help card must document ${command}`);
 	}
-	const ops = buttonValues(card).map((value) => value.op);
-	assert.deepEqual(ops, ["status", "workspace", "mode", "doctor"]);
+	// The classic help card has no callback buttons; new visuals are opt-in.
+	assert.equal(collectButtons(card).length, 0);
 });
 
 test("workspaceListCard: empty list explains how to add, no dead buttons", () => {

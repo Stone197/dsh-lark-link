@@ -125,7 +125,7 @@ dsh web
 | 会话类 | `/new` `/resume [序号\|id]` `/stop` | 新会话 / 恢复历史会话 / 停当前任务 |
 | 工作区 | `/workspace <路径>` `/cd <路径>` `/ws [list\|add\|use\|remove\|status]` | 切换工作区 / 同 `/workspace` / 收藏与复用工作空间 |
 | 诊断 | `/doctor` | ZIP 诊断包 |
-| 热改 | `/lark-config key=value` | 如 `streaming.runCard=false`、`inboundMerge.enabled=false`、`groupPolicy=open` |
+| 热改 | `/lark-config key=value` | 如 `streaming.runCard=true`、`inboundMerge.enabled=true`、`groupPolicy=open` |
 | DSH 命令 | `/compact` 等 | 原生执行，结果回飞书 |
 | 多媒体 | 发图片/文件 | 图片→视觉模型；文件→文本提取 |
 | 意图确认 | 模型提问 | 自动转飞书意图确认卡片 |
@@ -154,9 +154,9 @@ dsh web
 | `groupPolicy` | `open` | 群聊触发：`open`（免 @）/ `mention` / `keywords` / `reply` |
 | `agentPreset` | `ptc` | Agent preset（standard/ptc/minimal/cordis 或 GUI 自建） |
 | `permissionMode` | `danger-full-access` | read-only / workspace-write / danger-full-access |
-| `streaming.runCard` | `true` | **bridge 风格实时运行卡片**；关掉回退纯文本 |
+| `streaming.runCard` | `false` | bridge 风格实时运行卡片（**opt-in**，默认保持原版文本回复） |
 | `streaming.enabled` | `false` | 旧版单 markdown 流式卡片（与 runCard 独立） |
-| `inboundMerge.enabled` | `true` | 连续消息防抖合并 |
+| `inboundMerge.enabled` | `false` | 连续消息防抖合并（**opt-in**） |
 | `inboundMerge.silenceMs` | `1000` | 合并静默窗口 |
 | `reactions.enabled` | `true` | 表情回执 |
 | `allowlist` | `[]` | open_id 白名单（空 = 所有人） |
@@ -252,7 +252,7 @@ Both channels can drive the same DSH workspace simultaneously; each chat gets it
 
 ## ⚙️ Configuration
 
-Feishu keys are hot-reloadable via `/lark-config` (`groupPolicy`, `agentPreset`, `permissionMode`, `streaming.runCard` default **true**, `streaming.enabled` default false, `inboundMerge.enabled` default **true**, `allowlist`, `denyList`, `workspaceRoot`, attachments…). WeChat settings live in the `WeChat` settings panel and `~/.dsh-wechat/config.json` (same keys as dsh-wechat); plugin-level switches live under `wechat:` in `cordis.patch.yml`.
+Feishu keys are hot-reloadable via `/lark-config` (`groupPolicy`, `agentPreset`, `permissionMode`, `streaming.runCard` default **false** (opt-in), `streaming.enabled` default false, `inboundMerge.enabled` default **false** (opt-in), `allowlist`, `denyList`, `workspaceRoot`, attachments…). WeChat settings live in the `WeChat` settings panel and `~/.dsh-wechat/config.json` (same keys as dsh-wechat); plugin-level switches live under `wechat:` in `cordis.patch.yml`.
 
 ## 🧱 Architecture
 
