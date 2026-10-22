@@ -1557,6 +1557,10 @@ export function apply(ctx: Context, rawConfig: unknown): void {
 				const llm = services.get?.("llm") as
 					| {
 							listProviders?(): Array<{ id?: string; name?: string }>;
+							listConfigurableProviders?(): Array<{
+								id?: string;
+								name?: string;
+							}>;
 							listModels?(
 								p: string,
 							): Promise<Array<{ id: string; name?: string }>>;
@@ -1573,7 +1577,25 @@ export function apply(ctx: Context, rawConfig: unknown): void {
 						label?: string;
 						models: Array<{ id: string; name?: string }>;
 					}> = [];
-					const providers = llm?.listProviders?.() ?? [];
+					// Primary catalog: providers with a registered adapter. Older
+					// hosts can return [] before adapters finish mounting; fall back
+					// to the configurable-provider directory so /model never shows
+					// an empty card just because of load order.
+					let providers: Array<{ id?: string; name?: string }> = [];
+					try {
+						providers = llm?.listProviders?.() ?? [];
+					} catch {
+						providers = [];
+					}
+					if (!Array.isArray(providers) || providers.length === 0) {
+						try {
+							providers = (llm?.listConfigurableProviders?.() ?? []).map(
+								(p) => ({ id: p.id, name: p.name ?? p.id }),
+							);
+						} catch {
+							providers = [];
+						}
+					}
 					for (const p of providers) {
 						let models: Array<{ id: string; name?: string }> = [];
 						try {
@@ -1589,7 +1611,41 @@ export function apply(ctx: Context, rawConfig: unknown): void {
 							});
 						}
 					}
-					await sender.sendCard(msg.chatId, modelCard(current, groups));
+					if (groups.length === 0) {
+						// Never leave the user with a blank card: report what the
+						// host service actually exposed so it is diagnosable from chat.
+						logger.warn(
+							`/model: empty catalog (llm=${Boolean(llm)}, providers=${Array.isArray(providers) ? providers.length : "?"})`,
+						);
+						await durableReply(
+							name,
+							msg,
+							`当前模型: ${current?.provider ?? "?"}/${current?.model ?? "未设置"}\n` +
+								`未获取到可选模型列表（llm=${Boolean(llm)}, providers=${Array.isArray(providers) ? providers.length : "?"}）。\n` +
+								"可直接用 `/model <provider>/<model>` 手动切换，例如 `/model deepseek-account/deepseek-flash`。",
+						);
+						return true;
+					}
+					try {
+						await sender.sendCard(msg.chatId, modelCard(current, groups));
+					} catch (err) {
+						// Card delivery failed (permissions/size) — fall back to a
+						// plain-text list so model selection still works.
+						const lines = [
+							`当前模型: ${current?.provider ?? "?"}/${current?.model ?? "未设置"}`,
+							"",
+							"可用模型（发送 /model <provider>/<model> 切换）：",
+						];
+						for (const g of groups) {
+							for (const m of g.models) {
+								lines.push(`- ${g.provider}/${m.id}${m.name ? `（${m.name}）` : ""}`);
+							}
+						}
+						logger.warn(
+							`/model: card send failed, text fallback: ${err instanceof Error ? err.message : String(err)}`,
+						);
+						await durableReply(name, msg, lines.join("\n"));
+					}
 					return true;
 				}
 				// Switch: accept provider/model or bare model id (same provider).

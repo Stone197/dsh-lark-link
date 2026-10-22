@@ -22,7 +22,10 @@ interface WorkspaceStoreShape {
 		workspaceIds?: string[];
 	};
 	tables?: {
-		workspaces?: Record<string, { path?: string; title?: string } | undefined>;
+		workspaces?: Record<
+			string,
+			{ path?: string; title?: string; updatedAt?: string } | undefined
+		>;
 	};
 }
 
@@ -32,8 +35,15 @@ export function dshHomeDir(): string {
 }
 
 /**
- * The workspace the GUI most recently used, or undefined when it cannot be
+ * The workspace the GUI is most likely showing, or undefined when it cannot be
  * determined (fresh install, unreadable/legacy store).
+ *
+ * Order of preference:
+ *  1. the workspace updated most recently (`updatedAt`) — i.e. the one the
+ *     user is working in right now; bridge sessions created there appear right
+ *     next to their current conversation;
+ *  2. the GUI's default workspace id;
+ *  3. any surviving registered workspace.
  */
 export function detectDefaultWorkspaceRoot(): string | undefined {
 	try {
@@ -42,18 +52,29 @@ export function detectDefaultWorkspaceRoot(): string | undefined {
 		const store = JSON.parse(readFileSync(file, "utf8")) as WorkspaceStoreShape;
 		const workspaces = store.tables?.workspaces;
 		if (!workspaces) return undefined;
+		const entries = Object.entries(workspaces).filter(
+			(entry): entry is [string, { path?: string; updatedAt?: string }] =>
+				Boolean(entry[1]?.path),
+		);
+		const live = (path: string | undefined): path is string =>
+			typeof path === "string" && existsSync(path);
+		// 1. most recently updated workspace
+		const recent = entries
+			.filter(([, entry]) => live(entry.path))
+			.sort(
+				(a, b) =>
+					Date.parse(b[1].updatedAt ?? "") - Date.parse(a[1].updatedAt ?? ""),
+			)[0];
+		if (recent && live(recent[1].path)) return recent[1].path;
+		// 2. GUI default workspace
 		const id =
 			store.global?.defaultWorkspaceId ?? store.global?.workspaceIds?.[0];
 		const preferred = id ? workspaces[id]?.path : undefined;
-		if (preferred && existsSync(preferred)) return preferred;
-		// The default id may point at a removed directory; take the most
-		// recently registered surviving workspace instead.
-		const entries = Object.values(workspaces).filter(
-			(entry): entry is { path?: string } => Boolean(entry),
-		);
+		if (live(preferred)) return preferred;
+		// 3. any surviving workspace
 		for (let i = entries.length - 1; i >= 0; i--) {
-			const path = entries[i]?.path;
-			if (path && existsSync(path)) return path;
+			const path = entries[i]?.[1]?.path;
+			if (live(path)) return path;
 		}
 	} catch {
 		// best-effort only — fall back to cwd
