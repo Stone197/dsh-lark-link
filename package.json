@@ -1,7 +1,7 @@
 {
   "name": "dsh-lark-link",
-  "version": "0.6.0",
-  "description": "High-reliability Feishu/Lark bridge for DeepSeek Harness — QR one-click auth, multi-mode agents, card-based commands, zero-loss outbox, media in/out, session logs, reusable DSH Web GUI",
+  "version": "0.7.0",
+  "description": "Unified Feishu/Lark + WeChat bridge for DeepSeek Harness — QR one-click auth, live streaming run cards (reasoning/tool panels, collapsible, stop button, summary), card-based commands, queued/batched messages, zero-loss outbox, media in/out, shared settings console",
   "type": "module",
   "license": "MIT",
   "icon": "./assets/icon.svg",
@@ -15,6 +15,9 @@
     "deepseek-harness",
     "feishu",
     "lark",
+    "wechat",
+    "weixin",
+    "im",
     "bridge",
     "bot"
   ],
@@ -84,19 +87,20 @@
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
-    "@deepseek-ai/dsh-agent": "0.1.2-rc.1",
-    "@deepseek-ai/dsh-commands": "0.1.2-rc.1",
-    "@deepseek-ai/dsh-credentials": "0.1.2-rc.1",
-    "@deepseek-ai/dsh-llm": "0.1.2-rc.1",
-    "@deepseek-ai/dsh-session": "0.1.2-rc.1",
-    "@deepseek-ai/dsh-storage-domain": "0.1.2-rc.1",
-    "@deepseek-ai/dsh-system-prompt": "0.1.2-rc.1",
-    "@deepseek-ai/dsh-tools": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-agent": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-commands": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-credentials": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-llm": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-session": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-storage-domain": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-system-prompt": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-tools": "0.2.1-rc.2",
     "@types/node": "^24.3.0",
     "@types/qrcode": "^1.5.5",
     "@types/qrcode-terminal": "^0.12.2",
     "tsdown": "^0.22.14",
-    "typescript": "^5.9.2"
+    "typescript": "^5.9.2",
+    "vitest": "^4.1.8"
   },
   "dsh": {
     "bundle": {
@@ -115,6 +119,8 @@
     "icon.svg",
     "cordis.patch.yml",
     "README.md",
+    "README.zh.md",
+    "docs",
     "LICENSE",
     "CHANGELOG.md"
   ],
@@ -123,9 +129,12 @@
     "build": "tsdown",
     "check": "tsc --noEmit",
     "test": "node --experimental-strip-types --test \"test/**/*.test.ts\"",
+    "test:wechat": "vitest run --config vitest.wechat.config.mjs",
+    "test:all": "npm run test && npm run test:wechat",
     "prepack": "npm run build"
   },
   "engines": {
-    "node": ">=24.0.0"
+    "node": ">=24.0.0",
+    "dsh": ">=0.2.1-0 <0.3.0-0"
   }
 }

@@ -82,6 +82,7 @@ import {
 } from "./presentation/cards.ts";
 import type { GoalSnapshotState, TodoItemState } from "./common/types.ts";
 import { createTaskCardSyncer, type TaskCardSyncer } from "./outbound/task-card-syncer.ts";
+import { applyWechatChannel, type WechatChannelConfig } from "./wechat/index.ts";
 
 
 
@@ -130,6 +131,12 @@ export interface LarkLinkConfig {
 		retentionMinutes?: number;
 		maxAttempts?: number;
 	};
+	/**
+	 * WeChat channel (second IM surface, same plugin). Omitted = enabled with
+	 * defaults; `{ enabled: false }` keeps Feishu-only deployments untouched.
+	 * Configured in cordis.patch.yml under `wechat:` (env DSH_WECHAT_ENABLED).
+	 */
+	wechat?: WechatChannelConfig;
 }
 
 /** Bridge state directory (<DSH_HOME>/lark-link, overridable). */
@@ -2910,6 +2917,25 @@ export function apply(ctx: Context, rawConfig: unknown): void {
 		});
 	} catch {
 		// prompt section optional
+	}
+
+	// ---- WeChat channel (second IM surface, single package) -------------------
+	// Ported from pan17/dsh-wechat (MIT). Kept behind its own config block so a
+	// Feishu-only install is unaffected (`wechat.enabled: false`). The channel
+	// owns its own storage (~/.dsh-wechat by default) and keeps the existing
+	// login/token, so upgrading from standalone dsh-wechat needs no re-scan.
+	const wechatCfg = cfg?.wechat;
+	if (wechatCfg?.enabled !== false) {
+		let disposeWechat: (() => void | Promise<void>) | undefined;
+		try {
+			disposeWechat = applyWechatChannel(ctx, wechatCfg ?? {});
+		} catch (err) {
+			logger.warn(`WeChat channel failed to start: ${String(err)}`);
+		}
+		if (typeof disposeWechat === "function") {
+			const stopWechat = disposeWechat;
+			ctx.effect(() => () => stopWechat());
+		}
 	}
 
 	// ---- lifecycle registration (Cordis disposer — clean unload) ----------------

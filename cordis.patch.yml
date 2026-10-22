@@ -1,5 +1,6 @@
-# dsh-lark-link bundle patch — inserts the bridge plugin entry into the
-# composition. Users install via `dsh plugin add dsh-lark-link`.
+# dsh-lark-link bundle patch — inserts the unified bridge plugin entry into
+# the composition. One plugin, two channels: Feishu/Lark + WeChat.
+# Users install via `dsh plugin add dsh-lark-link`.
 - insert:
     - id: lark-link
       name: 'dsh-lark-link'
@@ -20,3 +21,15 @@
         #   auto: true
         #   retentionMinutes: 30
         #   maxAttempts: 2
+        #
+        # ── WeChat channel (ported from dsh-wechat) ──────────────────────────
+        # Disable with `wechat.enabled: false` or DSH_WECHAT_ENABLED=0.
+        # Storage defaults to ~/.dsh-wechat so an existing dsh-wechat login
+        # keeps working (no re-scan). The settings page can override the rest.
+        wechat:
+          enabled: !!js "process.env.DSH_WECHAT_ENABLED ?? 'true'"
+          # storageDir: ~/.dsh-wechat
+          # cwd: ''                 # default working directory for WeChat sessions
+          # silent: false           # only push the final reply of each turn
+          # finalOnly: false        # push one conclusion per whole task
+          # mergeEnabled: true      # debounce consecutive messages into one turn
