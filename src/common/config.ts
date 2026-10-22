@@ -21,8 +21,29 @@ export interface FeishuConfig {
 	 * 每轮输出直发完整回复；需要流式再热改开启). */
 	streaming: {
 		enabled: boolean;
+		/**
+		 * Run-card mode (bridge interaction parity): one live CardKit card per
+		 * turn that folds reasoning + tool-call panels + footer + summary and
+		 * carries the ⏹ stop button. Default ON — it is the signature UX of
+		 * this release; opt out with `/lark-config streaming.runCard=false`.
+		 * When CardKit is unavailable the forwarder falls back to the durable
+		 * outbox, so enabling it never loses content.
+		 */
+		runCard: boolean;
 		printFrequencyMs: number;
 		printStep: number;
+	};
+	/**
+	 * Inbound merge (防抖合并): consecutive plain-text messages from the SAME
+	 * conversation inside one quiet window are merged into a single agent
+	 * turn (bridge interaction parity). Commands, media, compensated replays
+	 * and messages from other routes bypass the queue entirely.
+	 */
+	inboundMerge: {
+		/** Master switch. false = legacy behavior (every message is its own turn). */
+		enabled: boolean;
+		/** Quiet window: flush once no new message arrived for this many ms. */
+		silenceMs: number;
 	};
 	/** Reaction receipts: random on inbound (pool excludes DONE), ✅ on completion. */
 	reactions: {
@@ -120,8 +141,18 @@ export const DEFAULT_CONFIG: FeishuConfig = {
 		// Default OFF (省流量): 每轮输出直发完整回复，流式卡作为可选增强
 		// (pi 31dc3c9 用户决策)。/lark-config streaming.enabled=true 热改开启。
 		enabled: false,
+		// Interaction parity (bridge): one live run card per turn, DEFAULT ON.
+		// It is independent from `enabled` (legacy text streaming): the run
+		// card is the released feature; set false to fall back to plain text.
+		runCard: true,
 		printFrequencyMs: 120,
 		printStep: 3,
+	},
+	inboundMerge: {
+		// Bridge parity: merge consecutive text messages into one turn
+		// (600ms in the reference bridge; 1000ms here for slower mobile typing).
+		enabled: true,
+		silenceMs: 1000,
 	},
 	reactions: {
 		enabled: true,
@@ -209,6 +240,7 @@ export const HOT_RELOADABLE: ReadonlyArray<keyof FeishuConfig> = [
 	"agentPreset",
 	"permissionMode",
 	"streaming",
+	"inboundMerge",
 	"reactions",
 	"denyList",
 	"allowlist",

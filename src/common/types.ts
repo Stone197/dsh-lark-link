@@ -168,6 +168,63 @@ export interface TaskCardState {
   lastUpdatedAt?: number;
 }
 
+/**
+ * Normalized live-run event consumed by the streaming run-card pipeline
+ * (bridge interaction parity, see docs/UNIFIED-IM-BRIDGE.md).
+ *
+ * This is a SUPERSET of `SessionEventOut` in `../sessions/dsh-session-backend.ts`:
+ * every pre-existing variant keeps its required fields, and the run-card
+ * fields below are optional so the legacy surface stays structurally
+ * assignable (the DSH adapter attaches them at the source):
+ *
+ *   - `tool/call`:   callId + parsed/raw `arguments` from the DSH event
+ *   - `tool/result`: `callId` correlation, `output` text, `error`/`isError`
+ *   - `reasoning/delta`: live reasoning from `agent/assistant-stream`
+ *   - `assistant/message`: `reasoning` carries the settled reasoning blocks
+ *   - `turn/end`: `errorMessage` carries the structured failure text
+ *
+ * Harness-agnostic: no DSH/Feishu imports.
+ */
+export type RunBridgeEvent =
+  | { type: "turn/start" }
+  | { type: "assistant/chunk"; text: string }
+  | {
+      type: "assistant/message";
+      text: string;
+      messageId?: string;
+      /** Full reasoning text settled with the message (merged reasoning blocks). */
+      reasoning?: string;
+    }
+  | {
+      type: "turn/end";
+      reason: string;
+      finalText?: string;
+      /** Human-readable failure text when reason === "error"/"failed". */
+      errorMessage?: string;
+    }
+  | { type: "reasoning/delta"; text: string }
+  | {
+      type: "tool/call";
+      name: string;
+      /** DSH `ToolCallId`, pairs the call with its tool/result. */
+      callId?: string;
+      /** Parsed JSON arguments object when the raw string parsed, else the raw string. */
+      arguments?: unknown;
+    }
+  | {
+      type: "tool/result";
+      /** Tool id; may be absent in the raw DSH event — correlate via callId. */
+      name?: string;
+      callId?: string;
+      /** Joined text content blocks of the result message. */
+      output?: string;
+      /** True when the tool result message is flagged as an error. */
+      isError?: boolean;
+      error?: { name: string; code: string };
+    }
+  | { type: "todo/write"; todos: TodoItemState[] }
+  | { type: "goal/change"; goal: GoalSnapshotState };
+
 /** Briefing data for an agent session restored via /resume. */
 export interface ResumedSessionBriefing {
   sessionId: string;

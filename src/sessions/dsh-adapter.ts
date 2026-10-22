@@ -138,6 +138,49 @@ function textOf(
 		.join("");
 }
 
+/** Settled reasoning text of an assistant message (merged reasoning blocks). */
+function reasoningOf(
+	blocks: readonly { type: string; text?: string }[] | undefined,
+): string | undefined {
+	const joined = (blocks ?? [])
+		.filter((b) => b.type === "reasoning" && b.text !== undefined)
+		.map((b) => b.text)
+		.join("");
+	return joined === "" ? undefined : joined;
+}
+
+/**
+ * `tool/call` carries the raw JSON argument string exactly as the model
+ * produced it. Parse it for presentation (the run card prints a JSON fence and
+ * an argument digest); on parse failure keep the raw string so nothing is lost.
+ */
+function parseToolArguments(raw: unknown): unknown {
+	if (typeof raw !== "string") return raw;
+	if (raw.trim() === "") return undefined;
+	try {
+		return JSON.parse(raw) as unknown;
+	} catch {
+		return raw;
+	}
+}
+
+/** Extended per-variant shapes the run-card pipeline consumes (superset). */
+type ToolCallOut = Extract<SessionEventOut, { type: "tool/call" }> & {
+	callId?: string;
+	arguments?: unknown;
+};
+type ToolResultOut = Extract<SessionEventOut, { type: "tool/result" }> & {
+	callId?: string;
+	output?: string;
+	isError?: boolean;
+};
+type AssistantMessageOut = Extract<SessionEventOut, { type: "assistant/message" }> & {
+	reasoning?: string;
+};
+type TurnEndOut = Extract<SessionEventOut, { type: "turn/end" }> & {
+	errorMessage?: string;
+};
+
 function toSessionEventOut(ev: SessionEvent): SessionEventOut | undefined {
 	const raw = ev as unknown as { type: string; data?: any };
 	switch (raw.type) {
@@ -149,10 +192,13 @@ function toSessionEventOut(ev: SessionEvent): SessionEventOut | undefined {
 				return { type: "assistant/chunk", text: c.text };
 			return undefined;
 		}
-		case "assistant/message":
-			return {
+		case "assistant/message": {
+			const content = raw.data?.message?.content as
+				| readonly { type: string; text?: string }[]
+				| undefined;
+			const out: AssistantMessageOut = {
 				type: "assistant/message",
-				text: textOf(raw.data?.message?.content),
+				text: textOf(content),
 				// GH #15: pass the stable AssistantMessage.id downstream — the
 				// outbound forwarder keys outbox idempotency on it, so a
 				// duplicated event delivery can't be sent twice.
@@ -161,16 +207,60 @@ function toSessionEventOut(ev: SessionEvent): SessionEventOut | undefined {
 						? raw.data.message.id
 						: undefined,
 			};
-		case "turn/end":
-			return { type: "turn/end", reason: raw.data?.reason?.kind ?? "done" };
-		case "tool/call":
-			return { type: "tool/call", name: raw.data?.name };
-		case "tool/result":
-			return {
-				type: "tool/result",
-				name: raw.data?.message?.content?.[0]?.type ?? "?",
-				error: raw.data?.error,
+			const reasoning = reasoningOf(content);
+			if (reasoning !== undefined) out.reasoning = reasoning;
+			return out;
+		}
+		case "turn/end": {
+			const reason = raw.data?.reason;
+			const out: TurnEndOut = {
+				type: "turn/end",
+				reason: reason?.kind ?? "done",
 			};
+			const failure = reason?.error as
+				| { message?: unknown; code?: unknown }
+				| undefined;
+			if (typeof failure?.message === "string" && failure.message !== "") {
+				out.errorMessage =
+					typeof failure.code === "string" && failure.code !== ""
+						? `${failure.code}: ${failure.message}`
+						: failure.message;
+			}
+			return out;
+		}
+		case "tool/call": {
+			const out: ToolCallOut = {
+				type: "tool/call",
+				name: typeof raw.data?.name === "string" ? raw.data.name : "?",
+			};
+			if (typeof raw.data?.callId === "string") out.callId = raw.data.callId;
+			const args = parseToolArguments(raw.data?.arguments);
+			if (args !== undefined) out.arguments = args;
+			return out;
+		}
+		case "tool/result": {
+			const message = raw.data?.message as
+				| { content?: readonly { type: string; text?: string }[]; isError?: boolean }
+				| undefined;
+			const out: ToolResultOut = {
+				type: "tool/result",
+				// Tool results carry no tool name in DSH; the run card correlates
+				// by callId. Keep the legacy fallback for older consumers.
+				name: raw.data?.name ?? message?.content?.[0]?.type ?? "?",
+			};
+			const resultCallId =
+				typeof raw.data?.callId === "string"
+					? raw.data.callId
+					: typeof (message as { toolCallId?: unknown } | undefined)?.toolCallId === "string"
+						? (message as { toolCallId: string }).toolCallId
+						: undefined;
+			if (resultCallId !== undefined) out.callId = resultCallId;
+			const output = textOf(message?.content);
+			if (output !== "") out.output = output;
+			if (message?.isError === true) out.isError = true;
+			if (raw.data?.error !== undefined) out.error = raw.data.error;
+			return out;
+		}
 		case "todo/write": {
 			const d = raw.data as { todos?: Array<{ content: string; status: "pending" | "in_progress" | "completed" }> };
 			if (Array.isArray(d?.todos)) {
@@ -1055,6 +1145,40 @@ export function createDshAdapter(deps: DshAdapterDeps): DshSessionBackend {
 		// subscriptions and the forwarder enqueued one reply N times. Both
 		// disposers are composed into ONE entry right after registration.
 
+		// Interaction parity: live reasoning deltas. `agent/assistant-stream`
+		// is process-local PRESENTATION data (the durable reasoning text is
+		// committed with assistant/message), so only `reasoning-delta` chunks
+		// are forwarded — they drive the run card's live "思考中" panel.
+		// The extra `reasoning/delta` variant is not part of SessionEventOut;
+		// bridge consumers see it through the wider RunBridgeEvent superset
+		// (src/common/types.ts). The cast is the single normalization boundary.
+		type AssistantStreamPayload = {
+			frame?: {
+				type?: string;
+				chunk?: { type?: string; text?: unknown };
+			};
+		};
+		const streamDisp = agent.ctx.on(
+			"agent/assistant-stream",
+			(payload: AssistantStreamPayload) => {
+				const frame = payload?.frame;
+				if (frame?.type !== "chunk") return;
+				const chunk = frame.chunk;
+				if (
+					chunk?.type !== "reasoning-delta" ||
+					typeof chunk.text !== "string" ||
+					chunk.text === ""
+				) {
+					return;
+				}
+				const out = { type: "reasoning/delta", text: chunk.text };
+				const set = listeners.get(key);
+				if (set) {
+					for (const fn of set) fn(out as unknown as SessionEventOut);
+				}
+			},
+		);
+
 
 
 		// Surface agent-loop failures that dsh-agent-loop's kick() swallows
@@ -1117,14 +1241,17 @@ export function createDshAdapter(deps: DshAdapterDeps): DshSessionBackend {
 				}
 			},
 		);
-		// GH #15: compose BOTH subscription disposers into a single entry —
-		// never overwrite one with the other.
+		// GH #15: compose ALL subscription disposers into a single entry —
+		// never overwrite one with another.
 		disposers.set(key, () => {
 			try {
 				disp();
 			} catch {}
 			try {
 				errDisp();
+			} catch {}
+			try {
+				streamDisp();
 			} catch {}
 		});
 

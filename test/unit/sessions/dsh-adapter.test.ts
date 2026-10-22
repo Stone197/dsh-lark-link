@@ -137,6 +137,7 @@ function fakeRegistry(
 		const id = sessionId;
 		const listeners = new Set<(ev: unknown) => void>();
 		const errorListeners = new Set<(payload: { error?: unknown }) => void>();
+		const streamListeners = new Set<(payload: unknown) => void>();
 		const agent = {
 			id,
 			status: "idle" as string,
@@ -152,11 +153,20 @@ function fakeRegistry(
 			emitAgentError(err: unknown) {
 				for (const fn of errorListeners) fn({ error: err });
 			},
+			/** Emit one `agent/assistant-stream` frame (interaction parity). */
+			emitAssistantStream(frame: unknown) {
+				for (const fn of streamListeners) fn({ agent, frame });
+			},
+			assistantStreamListenerCount: () => streamListeners.size,
 			ctx: {
 				on(event: string, fn: (s: unknown, ev: unknown) => void) {
 					if (event === "agent/error") {
 						errorListeners.add(fn as (payload: { error?: unknown }) => void);
 						return () => errorListeners.delete(fn as (payload: { error?: unknown }) => void);
+					}
+					if (event === "agent/assistant-stream") {
+						streamListeners.add(fn as (payload: unknown) => void);
+						return () => streamListeners.delete(fn as (payload: unknown) => void);
 					}
 					if (event !== "session/event") return () => {};
 					listeners.add((ev) => fn(undefined, ev));
@@ -1143,4 +1153,203 @@ test("adapter GH #15: assistant/message carries DSH's stable message id downstre
 	const msg = seen.find((e) => e.type === "assistant/message");
 	assert.ok(msg, "assistant/message forwarded");
 	assert.equal(msg?.messageId, "msg_abc123", "stable id threaded for dedupe keying");
+});
+
+// ---- interaction parity: run-card event normalization ------------------------
+
+test("adapter run-view: tool/call carries callId, name and PARSED arguments", async () => {
+	const registry = fakeRegistry();
+	const backend = mkBackend(ctxOf(registry, undefined));
+	const handle = await backend.ensureAgent("dm:ou_tool");
+	const events: Array<{
+		type: string;
+		callId?: string;
+		name?: string;
+		arguments?: unknown;
+	}> = [];
+	handle.onEvent((e) => events.push(e as never));
+	const agent = registry.agents.get(handle.sessionId) as {
+		ctx: { emit(event: string, ev: unknown): void };
+	};
+	agent.ctx.emit("session/event", {
+		type: "tool/call",
+		data: {
+			turn: 1,
+			step: 1,
+			callId: "call_42",
+			name: "bash",
+			arguments: '{"command":"pnpm test"}',
+		},
+	});
+	const ev = events.find((e) => e.type === "tool/call")!;
+	assert.equal(ev.callId, "call_42");
+	assert.equal(ev.name, "bash");
+	assert.deepEqual(ev.arguments, { command: "pnpm test" });
+});
+
+test("adapter run-view: tool/call keeps unparseable arguments as the raw string", async () => {
+	const registry = fakeRegistry();
+	const backend = mkBackend(ctxOf(registry, undefined));
+	const handle = await backend.ensureAgent("dm:ou_tool_raw");
+	const events: Array<{ type: string; arguments?: unknown }> = [];
+	handle.onEvent((e) => events.push(e as never));
+	const agent = registry.agents.get(handle.sessionId) as {
+		ctx: { emit(event: string, ev: unknown): void };
+	};
+	agent.ctx.emit("session/event", {
+		type: "tool/call",
+		data: { name: "bash", arguments: "not json" },
+	});
+	const ev = events.find((e) => e.type === "tool/call")!;
+	assert.equal(ev.arguments, "not json");
+});
+
+test("adapter run-view: tool/result carries callId, joined output and error flags", async () => {
+	const registry = fakeRegistry();
+	const backend = mkBackend(ctxOf(registry, undefined));
+	const handle = await backend.ensureAgent("dm:ou_tool_res");
+	const events: Array<{
+		type: string;
+		callId?: string;
+		output?: string;
+		isError?: boolean;
+		error?: { name: string; code: string };
+	}> = [];
+	handle.onEvent((e) => events.push(e as never));
+	const agent = registry.agents.get(handle.sessionId) as {
+		ctx: { emit(event: string, ev: unknown): void };
+	};
+	agent.ctx.emit("session/event", {
+		type: "tool/result",
+		data: {
+			turn: 1,
+			step: 1,
+			message: {
+				toolCallId: "call_42",
+				isError: true,
+				content: [
+					{ type: "text", text: "boom " },
+					{ type: "text", text: "exit 1" },
+				],
+			},
+			error: { name: "BashError", code: "E_EXIT" },
+		},
+	});
+	const ev = events.find((e) => e.type === "tool/result")!;
+	assert.equal(ev.callId, "call_42");
+	assert.equal(ev.output, "boom exit 1");
+	assert.equal(ev.isError, true);
+	assert.deepEqual(ev.error, { name: "BashError", code: "E_EXIT" });
+});
+
+test("adapter run-view: assistant/message carries settled reasoning blocks", async () => {
+	const registry = fakeRegistry();
+	const backend = mkBackend(ctxOf(registry, undefined));
+	const handle = await backend.ensureAgent("dm:ou_reason");
+	const events: Array<{ type: string; text?: string; reasoning?: string }> = [];
+	handle.onEvent((e) => events.push(e as never));
+	const agent = registry.agents.get(handle.sessionId) as {
+		ctx: { emit(event: string, ev: unknown): void };
+	};
+	agent.ctx.emit("session/event", {
+		type: "assistant/message",
+		data: {
+			message: {
+				content: [
+					{ type: "reasoning", text: "think " },
+					{ type: "reasoning", text: "first" },
+					{ type: "text", text: "final answer" },
+				],
+			},
+		},
+	});
+	const ev = events.find((e) => e.type === "assistant/message")!;
+	assert.equal(ev.text, "final answer");
+	assert.equal(ev.reasoning, "think first");
+});
+
+test("adapter run-view: turn/end error reason carries the structured error message", async () => {
+	const registry = fakeRegistry();
+	const backend = mkBackend(ctxOf(registry, undefined));
+	const handle = await backend.ensureAgent("dm:ou_err");
+	const events: Array<{ type: string; reason?: string; errorMessage?: string }> = [];
+	handle.onEvent((e) => events.push(e as never));
+	const agent = registry.agents.get(handle.sessionId) as {
+		ctx: { emit(event: string, ev: unknown): void };
+	};
+	agent.ctx.emit("session/event", {
+		type: "turn/end",
+		data: {
+			reason: {
+				kind: "error",
+				error: { message: "model down", code: "UNKNOWN" },
+			},
+		},
+	});
+	const ev = events.find((e) => e.type === "turn/end")!;
+	assert.equal(ev.reason, "error");
+	assert.equal(ev.errorMessage, "UNKNOWN: model down");
+});
+
+test("adapter run-view: agent/assistant-stream reasoning-delta is forwarded as reasoning/delta", async () => {
+	const registry = fakeRegistry();
+	const backend = mkBackend(ctxOf(registry, undefined));
+	const handle = await backend.ensureAgent("dm:ou_stream");
+	const events: Array<{ type: string; text?: string }> = [];
+	handle.onEvent((e) => events.push(e as never));
+	const agent = registry.agents.get(handle.sessionId) as {
+		emitAssistantStream(frame: unknown): void;
+	};
+	agent.emitAssistantStream({
+		type: "chunk",
+		attemptId: "a1",
+		revision: 1,
+		index: 0,
+		time: 0,
+		chunk: { type: "reasoning-delta", index: 0, text: "hmm" },
+	});
+	const ev = events.find((e) => e.type === "reasoning/delta")!;
+	assert.ok(ev, "reasoning/delta forwarded");
+	assert.equal(ev.text, "hmm");
+});
+
+test("adapter run-view: non-reasoning assistant-stream frames are ignored", async () => {
+	const registry = fakeRegistry();
+	const backend = mkBackend(ctxOf(registry, undefined));
+	const handle = await backend.ensureAgent("dm:ou_stream2");
+	const events: Array<{ type: string }> = [];
+	handle.onEvent((e) => events.push(e as never));
+	const agent = registry.agents.get(handle.sessionId) as {
+		emitAssistantStream(frame: unknown): void;
+	};
+	agent.emitAssistantStream({ type: "start", attemptId: "a1", revision: 1, turn: 1, step: 1 });
+	agent.emitAssistantStream({
+		type: "chunk",
+		chunk: { type: "text-delta", index: 0, text: "visible text" },
+	});
+	agent.emitAssistantStream({
+		type: "chunk",
+		chunk: { type: "reasoning-delta", index: 1, text: "" },
+	});
+	assert.equal(events.length, 0, "only non-empty reasoning deltas are forwarded");
+});
+
+test("adapter run-view: dispose unsubscribes the assistant-stream listener too", async () => {
+	const registry = fakeRegistry();
+	const backend = mkBackend(ctxOf(registry, undefined));
+	const handle = await backend.ensureAgent("dm:ou_stream_dispose");
+	const agent = registry.agents.get(handle.sessionId) as {
+		assistantStreamListenerCount(): number;
+		emitAssistantStream(frame: unknown): void;
+	};
+	const events: Array<{ type: string }> = [];
+	handle.onEvent((e) => events.push(e as never));
+	assert.equal(agent.assistantStreamListenerCount(), 1);
+	await backend.dispose("dm:ou_stream_dispose");
+	assert.equal(agent.assistantStreamListenerCount(), 0, "no leaked stream subscription");
+	agent.emitAssistantStream({
+		type: "chunk",
+		chunk: { type: "reasoning-delta", index: 0, text: "after dispose" },
+	});
+	assert.equal(events.length, 0);
 });

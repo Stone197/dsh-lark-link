@@ -1,4 +1,5 @@
-// Workspace session listing for the Feishu-side /resume command.
+// Workspace session listing for the Feishu-side /resume command, plus the
+// saved-workspace store behind /ws (list|add|use|remove|status).
 //
 // Lists the HISTORICAL DSH sessions of one workspace (cwd) so a Feishu chat can
 // pick one up again. Two layered sources (same discipline as doctor's export):
@@ -13,8 +14,9 @@
 //
 // Harness-agnostic: the service is injected as a narrow structural interface.
 
-import { existsSync, readdirSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join, posix, win32 } from "node:path";
 
 /** Header-like row of the DSH sessionPersistence service (structural slice). */
 export interface SessionHeaderLike {
@@ -231,3 +233,208 @@ export async function listWorkspaceSessions(
 }
 
 
+// ---- saved workspaces (/ws) ------------------------------------------------
+//
+// `/ws add|use|remove|list` manages a small FAVOURITES list of working
+// directories, kept at <DSH_HOME>/lark-link/workspaces.json (the same state
+// directory as the rest of the bridge). It is deliberately separate from the
+// per-conversation override store: `/ws add` only SAVES a path, `/ws use` and
+// `/cd` are what switch the conversation (and those go through the existing
+// /workspace handler so the per-conversation override + session rotation stay
+// in one place).
+
+export interface SavedWorkspaceEntry {
+	/** Absolute, normalized path. */
+	path: string;
+	/** Optional short label (the card falls back to the basename). */
+	label?: string;
+	addedAt: number;
+	lastUsedAt?: number;
+}
+
+export interface SavedWorkspaceStore {
+	/** The backing file (exposed for /ws status output and tests). */
+	file(): string;
+	/** Saved workspaces in ADD order — the order /ws list numbers them. */
+	list(): SavedWorkspaceEntry[];
+	has(path: string): boolean;
+	add(
+		path: string,
+		label?: string,
+	): { added: boolean; entry: SavedWorkspaceEntry; index: number };
+	remove(path: string): boolean;
+	touch(path: string): void;
+}
+
+/** `<DSH_HOME>/lark-link/workspaces.json` (`~/.dsh` when DSH_HOME is unset). */
+export function defaultWorkspacesFile(
+	env: NodeJS.ProcessEnv = process.env,
+): string {
+	return join(
+		env.DSH_HOME ?? join(homedir(), ".dsh"),
+		"lark-link",
+		"workspaces.json",
+	);
+}
+
+/** True when `p` looks like a Windows drive/UNC path. */
+function isWinShaped(p: string): boolean {
+	return /^[A-Za-z]:[\\/]/.test(p) || p.startsWith("\\\\");
+}
+
+/**
+ * Normalize a saved path: trim, platform-correct normalize, drop trailing
+ * separators (except a bare root). Keeps the Windows shape on every host so a
+ * path typed into a Windows-hosted bridge is stored verbatim.
+ */
+export function normalizeWorkspacePath(input: string): string {
+	const trimmed = input.trim();
+	if (!trimmed) return "";
+	const normalized = isWinShaped(trimmed)
+		? win32.normalize(trimmed)
+		: posix.normalize(trimmed);
+	const stripped =
+		normalized.length > 1 ? normalized.replace(/[\\/]+$/, "") : normalized;
+	// "D:\\" normalizes to itself; stripping its separator would turn it into
+	// the drive-RELATIVE "D:" — a different (and meaningless) path.
+	return /^[A-Za-z]:$/.test(stripped) ? normalized : stripped;
+}
+
+/** Case/separator-insensitive comparison (case folds only for Windows paths). */
+export function sameWorkspacePath(a: string, b: string): boolean {
+	const na = normalizeWorkspacePath(a);
+	const nb = normalizeWorkspacePath(b);
+	if (!na || !nb) return false;
+	return isWinShaped(na) || isWinShaped(nb)
+		? na.toLowerCase() === nb.toLowerCase()
+		: na === nb;
+}
+
+/**
+ * Resolve a `/ws use|remove` argument: a 1-based number matching /ws list, or
+ * an exact path. Returns undefined when it matches nothing.
+ */
+export function findSavedWorkspace(
+	entries: readonly SavedWorkspaceEntry[],
+	ref: string,
+): { entry: SavedWorkspaceEntry; index: number } | undefined {
+	const needle = ref.trim();
+	if (!needle) return undefined;
+	if (/^\d+$/.test(needle)) {
+		const index = Number(needle) - 1;
+		const entry = entries[index];
+		return entry ? { entry, index } : undefined;
+	}
+	const index = entries.findIndex(
+		(entry) => sameWorkspacePath(entry.path, needle),
+	);
+	return index === -1 ? undefined : { entry: entries[index] as SavedWorkspaceEntry, index };
+}
+
+interface PersistedWorkspaces {
+	version?: number;
+	workspaces?: unknown[];
+}
+
+/**
+ * JSON-file backed saved-workspace store.
+ *
+ * Load is lazy and tolerant (missing/corrupt file = empty list, never a
+ * crash); persist is best-effort (a read-only state dir must not break /ws
+ * use — the in-memory list still works for the session). Writes go through a
+ * temp file + rename so a crash mid-write cannot truncate the list.
+ */
+export function createSavedWorkspaceStore(
+	file: string,
+	now: () => number = Date.now,
+): SavedWorkspaceStore {
+	let entries: SavedWorkspaceEntry[] | undefined;
+
+	const load = (): SavedWorkspaceEntry[] => {
+		if (entries) return entries;
+		const loaded: SavedWorkspaceEntry[] = [];
+		try {
+			const raw = JSON.parse(readFileSync(file, "utf8")) as unknown;
+			const rows = Array.isArray(raw)
+				? raw
+				: (raw as PersistedWorkspaces | null)?.workspaces;
+			if (Array.isArray(rows)) {
+				for (const row of rows) {
+					const rec = row as Partial<SavedWorkspaceEntry> | undefined;
+					if (!rec || typeof rec.path !== "string") continue;
+					const path = normalizeWorkspacePath(rec.path);
+					if (!path || loaded.some((e) => sameWorkspacePath(e.path, path))) continue;
+					loaded.push({
+						path,
+						...(typeof rec.label === "string" && rec.label.trim()
+							? { label: rec.label.trim() }
+							: {}),
+						addedAt: typeof rec.addedAt === "number" ? rec.addedAt : now(),
+						...(typeof rec.lastUsedAt === "number"
+							? { lastUsedAt: rec.lastUsedAt }
+							: {}),
+					});
+				}
+			}
+		} catch {
+			// first run / unreadable file — start empty
+		}
+		entries = loaded;
+		return entries;
+	};
+
+	const persist = (rows: SavedWorkspaceEntry[]): void => {
+		try {
+			mkdirSync(dirname(file), { recursive: true });
+			const tmp = `${file}.${process.pid}.tmp`;
+			writeFileSync(tmp, JSON.stringify({ version: 1, workspaces: rows }, null, 2), {
+				mode: 0o600,
+			});
+			renameSync(tmp, file);
+		} catch {
+			// read-only state dir: keep the in-memory list, do not fail the command
+		}
+	};
+
+	return {
+		file: () => file,
+		list: () => load().map((entry) => ({ ...entry })),
+		has(path) {
+			const target = normalizeWorkspacePath(path);
+			return load().some((entry) => sameWorkspacePath(entry.path, target));
+		},
+		add(path, label) {
+			const rows = load();
+			const target = normalizeWorkspacePath(path);
+			const existing = rows.findIndex((entry) => sameWorkspacePath(entry.path, target));
+			if (existing !== -1) {
+				return { added: false, entry: { ...(rows[existing] as SavedWorkspaceEntry) }, index: existing };
+			}
+			const entry: SavedWorkspaceEntry = {
+				path: target,
+				...(label && label.trim() ? { label: label.trim() } : {}),
+				addedAt: now(),
+			};
+			rows.push(entry);
+			persist(rows);
+			return { added: true, entry: { ...entry }, index: rows.length - 1 };
+		},
+		remove(path) {
+			const rows = load();
+			const target = normalizeWorkspacePath(path);
+			const index = rows.findIndex((entry) => sameWorkspacePath(entry.path, target));
+			if (index === -1) return false;
+			rows.splice(index, 1);
+			persist(rows);
+			return true;
+		},
+		touch(path) {
+			const rows = load();
+			const target = normalizeWorkspacePath(path);
+			const entry = rows.find((row) => sameWorkspacePath(row.path, target));
+			if (!entry) return;
+			entry.lastUsedAt = now();
+			persist(rows);
+		},
+	};
+}

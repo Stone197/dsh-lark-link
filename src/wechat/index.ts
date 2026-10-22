@@ -11,5 +11,9 @@
 //     caller catches and logs, but a throwing apply would take Feishu down too
 //   - returns a disposer (sync or async) that stops the WeChat monitor and
 //     releases every registration made on `ctx`
-export { applyWechatChannel } from "./plugin.ts";
-export type { WechatChannelConfig } from "./plugin.ts";
+export { applyWechatChannel, sessionIdFrom } from "./plugin.ts";
+export type {
+	WechatChannelConfig,
+	WechatChannelDisposer,
+	PluginConfig,
+} from "./plugin.ts";

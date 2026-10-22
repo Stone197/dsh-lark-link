@@ -11,6 +11,7 @@ import type { CommandRouter } from "./command-router.ts";
 import { createReactionPicker } from "../common/reactions.ts";
 import type { AttachmentInput } from "../sessions/dsh-session-backend.ts";
 import type { InboundWal } from "../inbound/inbound-wal.ts";
+import { PendingQueue, type TimerApi } from "../outbound/pending-queue.ts";
 
 export interface MessageHandlerDeps {
 	ctx: BridgeContextRead;
@@ -35,12 +36,70 @@ export interface MessageHandlerDeps {
 	 * ref (`imageRef`) is still produced for vision-capable models.
 	 */
 	inboundDir?: string;
+	/**
+	 * Injectable timer API for the inbound merge queue. Production uses the
+	 * global timers; unit tests drive flushes deterministically.
+	 */
+	mergeTimers?: TimerApi;
 }
 
 export interface MessageHandler {
 	handleInbound(msg: FeishuInboundMessage): Promise<"processed" | "dropped">;
 	/** Compensation replay path (skipDedupe semantics handled by caller). */
 	handleCompensated(msg: FeishuInboundMessage): Promise<void>;
+	/**
+	 * Pause merge flushing for one conversation scope — a turn is running and
+	 * new messages must accumulate instead of starting another turn. Optional
+	 * so existing embedders keep working; the host wires it to turn/start.
+	 */
+	pauseMerge?(scope: string): void;
+	/** Resume merging: arms a fresh quiet window if messages accumulated. */
+	resumeMerge?(scope: string): void;
+	/** Cancel pending merge timers/batches (plugin shutdown). */
+	dispose?(): void;
+}
+
+/** One message waiting in the inbound merge queue. */
+export interface QueuedInboundMessage {
+	msg: FeishuInboundMessage;
+	sessionKey: string;
+	attachments: AttachmentInput[];
+}
+
+/**
+ * Merge a debounce batch into ONE pseudo message:
+ *   - text: arrived order, joined with a blank line
+ *   - attachments: concatenated
+ *   - base: the LAST message (messageId = DONE-reaction trigger + the single
+ *     WAL record), so `route.lastMessageId` still marks the right request
+ *   - mentions: de-duplicated union
+ */
+export function mergeInboundBatch(batch: QueuedInboundMessage[]): {
+	msg: FeishuInboundMessage;
+	attachments: AttachmentInput[];
+	sessionKey: string;
+} {
+	const last = batch[batch.length - 1]!;
+	const mergedText = batch
+		.map((entry) => (entry.msg.text ?? entry.msg.content ?? "").trim())
+		.filter((text) => text !== "")
+		.join("\n\n");
+	const attachments = batch.flatMap((entry) => entry.attachments);
+	const mentions = [
+		...new Set(batch.flatMap((entry) => entry.msg.mentions ?? [])),
+	];
+	return {
+		sessionKey: last.sessionKey,
+		attachments,
+		msg: {
+			...last.msg,
+			messageId: last.msg.messageId,
+			msgType: "text",
+			content: mergedText,
+			text: mergedText,
+			mentions,
+		},
+	};
 }
 
 /**
@@ -294,6 +353,149 @@ async function resolveOneImage(
 export function createMessageHandler(deps: MessageHandlerDeps): MessageHandler {
 	const logger = deps.ctx.logger;
 
+	// ---- inbound merge queue (防抖合并, bridge parity) ------------------------
+	// One PendingQueue for the whole bridge; scope = conversation sessionKey.
+	// The queue is created lazily from the LIVE config so hot reload works;
+	// the quiet-window length is a constructor knob, so a changed silenceMs
+	// rebuilds the queue (any half-open window is dropped — rare, logged).
+	let mergeQueue: PendingQueue<QueuedInboundMessage> | undefined;
+	let mergeSilenceMs = -1;
+
+	function queueFor(silenceMs: number): PendingQueue<QueuedInboundMessage> {
+		const delayMs = Math.max(0, Math.floor(silenceMs));
+		if (mergeQueue && mergeSilenceMs === delayMs) return mergeQueue;
+		if (mergeQueue) {
+			mergeQueue.cancelAll();
+			logger.warn(
+				`inboundMerge.silenceMs changed ${mergeSilenceMs}ms → ${delayMs}ms; pending merge windows dropped`,
+			);
+		}
+		mergeSilenceMs = delayMs;
+		mergeQueue = new PendingQueue<QueuedInboundMessage>({
+			delayMs,
+			timers: deps.mergeTimers,
+			// Commands are bypassed BEFORE enqueue (they never reach this queue).
+			isCommand: () => false,
+			onFlush: (scope, batch) => {
+				// PendingQueue.onFlush is synchronous; dispatch is async by nature.
+				void flushMergedBatch(scope, batch);
+			},
+			onError: (err, scope) => {
+				logger.warn(
+					`inbound merge queue error (${scope}): ${err instanceof Error ? err.message : String(err)}`,
+				);
+			},
+		});
+		return mergeQueue;
+	}
+
+	/**
+	 * Dispatch one merged turn. The scope stays BLOCKED while the dispatch is
+	 * in flight (+ until the host resumes it on turn/end via pauseMerge), so a
+	 * burst cannot start overlapping turns for the same conversation.
+	 */
+	async function flushMergedBatch(
+		scope: string,
+		batch: QueuedInboundMessage[],
+	): Promise<void> {
+		if (batch.length === 0) return;
+		const queue = mergeQueue;
+		queue?.block(scope);
+		try {
+			const merged = mergeInboundBatch(batch);
+			logger.info(
+				`inbound merge flush: ${scope} ← ${batch.length} message(s)`,
+			);
+			await dispatchAgentMessage(
+				merged.msg,
+				merged.attachments,
+				merged.sessionKey,
+				true,
+			);
+		} catch (err) {
+			// Never let a flush failure escape (unhandled rejection) or silence
+			// the loss — log it with the scope so it is diagnosable.
+			logger.error(
+				`inbound merge dispatch failed (${scope}): ${err instanceof Error ? err.message : String(err)}`,
+			);
+		} finally {
+			queue?.unblock(scope);
+		}
+	}
+
+	/**
+	 * Shared agent dispatch: route upsert (DONE-reaction target), optional WAL
+	 * journaling, then the conversation turn. Returns the MessageHandler
+	 * outcome for the direct path; the merged path logs failures instead.
+	 */
+	async function dispatchAgentMessage(
+		msg: FeishuInboundMessage,
+		attachments: AttachmentInput[],
+		sessionKey: string,
+		journal: boolean,
+	): Promise<"processed" | "dropped"> {
+		const cm = deps.ctx.conversations;
+		if (!cm) {
+			logger.error(
+				"message dropped: conversations not assembled (late wiring?)",
+			);
+			return "dropped";
+		}
+		// Establish/refresh the delivery route (sessionKey → chatId) so the
+		// event forwarder can route the agent's reply back to this Feishu chat.
+		// Without this the forwarder drops every reply (routeFor → undefined).
+		deps.ctx.router?.upsert({
+			sessionKey,
+			chatId: msg.chatId,
+			chatType: msg.chatType,
+			// Remember the trigger message so turn-end can DONE-reaction it.
+			lastMessageId: msg.messageId,
+			updatedAt: Date.now(),
+		});
+		// Durably record the agent-bound request BEFORE enqueuing it, so a
+		// crash/plugin-reload mid-turn can re-trigger it on boot. Only text
+		// (media replay isn't reliable, and there may be none to rescue).
+		const isText = msg.msgType === "text" || (msg.text ?? "").trim() !== "";
+		// Only fresh inbound requests are journaled. A compensated re-dispatch
+		// (missed-compensation for WS drops, or inbound-wal boot replay) must
+		// NOT re-accept — replay already counted the attempt, and re-accepting
+		// would reset its attempt cap and let a broken request loop forever.
+		if (journal && isText && deps.wal) {
+			try {
+				deps.wal.accept({
+					messageId: msg.messageId,
+					sessionKey,
+					chatId: msg.chatId,
+					chatType: msg.chatType,
+					senderOpenId: msg.senderOpenId,
+					text: (msg.text ?? msg.content ?? "").slice(0, 8_000),
+				});
+			} catch (err) {
+				logger.warn(
+					`inbound-wal accept failed: ${
+						err instanceof Error ? err.message : String(err)
+					}`,
+				);
+			}
+		}
+		try {
+			await cm.handleMessage(msg, attachments);
+		} catch (err) {
+			logger.error(`conversation handling failed: ${String(err)}`);
+			return "dropped";
+		}
+		return "processed";
+	}
+
+	/** Plain text eligible for merge: text message, non-empty, not a command. */
+	function isMergeableText(msg: FeishuInboundMessage): boolean {
+		const text = (msg.text ?? msg.content ?? "").trim();
+		if (text === "" || text.startsWith("/")) return false;
+		// Media/rich-post messages carry attachments and cannot be merged
+		// losslessly into one text prompt → direct path.
+		return msg.msgType === "text";
+	}
+
 	async function handle(
 		msg: FeishuInboundMessage,
 		compensated: boolean,
@@ -337,58 +539,43 @@ export function createMessageHandler(deps: MessageHandlerDeps): MessageHandler {
 				);
 				return "dropped";
 			}
-			// Establish/refresh the delivery route (sessionKey → chatId) so the
-			// event forwarder can route the agent's reply back to this Feishu chat.
-			// Without this the forwarder drops every reply (routeFor → undefined).
 			const sessionKey = cm.keyFor(msg);
-			deps.ctx.router?.upsert({
-				sessionKey,
-				chatId: msg.chatId,
-				chatType: msg.chatType,
-				// Remember the trigger message so turn-end can DONE-reaction it.
-				lastMessageId: msg.messageId,
-				updatedAt: Date.now(),
-			});
-			// Inbound multimedia (M6): image → attachment store, file → text.
+			// 6. inbound merge (bridge parity): consecutive plain-text messages
+			// inside one quiet window become ONE agent turn. Commands, media,
+			// compensated replays and a disabled config keep the direct path.
+			const mergeCfg = deps.ctx.cfg().inboundMerge;
+			const mergeable =
+				mergeCfg.enabled && !compensated && isMergeableText(msg);
+			if (mergeable) {
+				const attachments = await resolveInboundAttachments(
+					msg,
+					deps.ctx,
+					deps.inboundDir,
+				);
+				// WAL + route upsert are DEFERRED to the flush: one merged pseudo
+				// message = one WAL record (last messageId + merged text), which is
+				// exactly what route.lastMessageId marks delivered.
+				queueFor(mergeCfg.silenceMs).push(sessionKey, {
+					msg,
+					sessionKey,
+					attachments,
+				});
+				return "processed";
+			}
 			const attachments = await resolveInboundAttachments(
 				msg,
 				deps.ctx,
 				deps.inboundDir,
 			);
-			// Durably record the agent-bound request BEFORE enqueuing it, so a
-			// crash/plugin-reload mid-turn can re-trigger it on boot. Only text
-			// (media replay isn't reliable, and there may be none to rescue).
-			const isText = msg.msgType === "text" || (msg.text ?? "").trim() !== "";
-			// Only fresh inbound requests are journaled. A compensated re-dispatch
-			// (missed-compensation for WS drops, or inbound-wal boot replay) must
-			// NOT re-accept — replay already counted the attempt, and re-accepting
-			// would reset its attempt cap and let a broken request loop forever.
-			if (isText && !compensated && deps.wal) {
-				try {
-					deps.wal.accept({
-						messageId: msg.messageId,
-						sessionKey,
-						chatId: msg.chatId,
-						chatType: msg.chatType,
-						senderOpenId: msg.senderOpenId,
-						text: (msg.text ?? msg.content ?? "").slice(0, 8_000),
-					});
-				} catch (err) {
-					logger.warn(
-						`inbound-wal accept failed: ${
-							err instanceof Error ? err.message : String(err)
-						}`,
-					);
-				}
-			}
-			try {
-				await cm.handleMessage(msg, attachments);
-			} catch (err) {
-				logger.error(`conversation handling failed: ${String(err)}`);
-				return "dropped";
-			}
+			const result = await dispatchAgentMessage(
+				msg,
+				attachments,
+				sessionKey,
+				!compensated,
+			);
+			if (result === "processed" && compensated) deps.onReinjected?.(msg);
+			return result;
 		}
-		if (compensated) deps.onReinjected?.(msg);
 		return "processed";
 	}
 
@@ -398,6 +585,17 @@ export function createMessageHandler(deps: MessageHandlerDeps): MessageHandler {
 		},
 		async handleCompensated(msg) {
 			await handle(msg, true);
+		},
+		pauseMerge(scope) {
+			mergeQueue?.block(scope);
+		},
+		resumeMerge(scope) {
+			mergeQueue?.unblock(scope);
+		},
+		dispose() {
+			mergeQueue?.cancelAll();
+			mergeQueue = undefined;
+			mergeSilenceMs = -1;
 		},
 	};
 }

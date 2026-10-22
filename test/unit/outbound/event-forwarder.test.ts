@@ -39,6 +39,12 @@ function makeForwarder(opts: { streaming?: boolean; failStream?: boolean; finali
       if (opts.finalizeThrows) throw new Error("finalize down");
       return "card-1";
     },
+    async updateCard() {
+      // whole-card run mode is off in these legacy tests
+    },
+    async finalizeCard() {
+      throw new Error("run card not supported by this fake");
+    },
   };
   const streamTarget: StreamTarget = {
     route: routeRef,
@@ -265,6 +271,10 @@ test("forwarder: stream handle disposed mid-turn falls through to outbox for fin
     disposed: true, // e.g. createCard threw 400 on the first chunk
     async patch() {},
     async finalize() {
+      throw new Error("Stream handle was disposed");
+    },
+    async updateCard() {},
+    async finalizeCard(): Promise<string> {
       throw new Error("Stream handle was disposed");
     },
   };

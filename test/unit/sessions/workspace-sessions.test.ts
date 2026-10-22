@@ -8,6 +8,11 @@ import {
 	decodeSessionDirName,
 	listWorkspaceSessions,
 	extractTitleFromEvents,
+	createSavedWorkspaceStore,
+	defaultWorkspacesFile,
+	findSavedWorkspace,
+	normalizeWorkspacePath,
+	sameWorkspacePath,
 } from "../../../src/sessions/workspace-sessions.ts";
 
 
@@ -246,3 +251,128 @@ test("list: inspect resolves titles from persistence events", async () => {
 	assert.equal(rows[0]!.title, "测试会话标题提取");
 });
 
+
+// ---- saved workspaces (/ws store) ------------------------------------------
+
+function tempWorkspaceFile(): { dir: string; file: string } {
+	const dir = mkdtempSync(join(tmpdir(), "lark-link-ws-"));
+	return { dir, file: join(dir, "state", "workspaces.json") };
+}
+
+test("saved workspaces: default file lives under <DSH_HOME>/lark-link", () => {
+	assert.equal(
+		defaultWorkspacesFile({ DSH_HOME: "/tmp/dsh-home" } as NodeJS.ProcessEnv),
+		join("/tmp/dsh-home", "lark-link", "workspaces.json"),
+	);
+	// Unset DSH_HOME → ~/.dsh/lark-link/workspaces.json
+	assert.match(defaultWorkspacesFile({} as NodeJS.ProcessEnv), /[/\\]\.dsh[/\\]lark-link[/\\]workspaces\.json$/);
+});
+
+test("saved workspaces: normalize drops trailing separators, keeps roots", () => {
+	assert.equal(normalizeWorkspacePath("  /Users/me/app/  "), "/Users/me/app");
+	assert.equal(normalizeWorkspacePath("/"), "/");
+	assert.equal(normalizeWorkspacePath(""), "");
+	assert.equal(normalizeWorkspacePath("D:\\work\\app\\"), "D:\\work\\app");
+	assert.equal(normalizeWorkspacePath("D:\\"), "D:\\");
+});
+
+test("saved workspaces: comparison folds separators and Windows case", () => {
+	assert.equal(sameWorkspacePath("/a/b", "/a/b/"), true);
+	assert.equal(sameWorkspacePath("/a/b", "/a/c"), false);
+	assert.equal(sameWorkspacePath("D:\\Work\\App", "d:\\work\\app"), true);
+	assert.equal(sameWorkspacePath("", ""), false);
+});
+
+test("saved workspaces: add/list/remove round-trips through JSON", () => {
+	const { dir, file } = tempWorkspaceFile();
+	try {
+		let now = 1000;
+		const store = createSavedWorkspaceStore(file, () => (now += 1));
+		assert.deepEqual(store.list(), []);
+		assert.equal(store.file(), file);
+
+		const first = store.add("/Users/me/app");
+		assert.equal(first.added, true);
+		assert.equal(first.index, 0);
+		assert.equal(first.entry.path, "/Users/me/app");
+		assert.equal(first.entry.addedAt, 1001);
+
+		const second = store.add(dir, "project");
+		assert.equal(second.added, true);
+		assert.equal(second.entry.label, "project");
+		assert.equal(second.index, 1);
+
+		// Duplicate add (trailing separator) does not append.
+		const dup = store.add("/Users/me/app/");
+		assert.equal(dup.added, false);
+		assert.equal(dup.index, 0);
+		assert.equal(store.list().length, 2);
+
+		// A fresh store reads the persisted file.
+		const reloaded = createSavedWorkspaceStore(file);
+		assert.deepEqual(
+			reloaded.list().map((entry) => entry.path),
+			["/Users/me/app", dir],
+		);
+		assert.equal(reloaded.has("/Users/me/app"), true);
+		assert.equal(reloaded.has("/nope"), false);
+
+		assert.equal(reloaded.remove("/Users/me/app/"), true);
+		assert.equal(reloaded.remove("/Users/me/app"), false);
+		assert.deepEqual(
+			createSavedWorkspaceStore(file).list().map((entry) => entry.path),
+			[dir],
+		);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("saved workspaces: touch records lastUsedAt without reordering", () => {
+	const { dir, file } = tempWorkspaceFile();
+	try {
+		const store = createSavedWorkspaceStore(file, () => 5000);
+		store.add("/a");
+		store.add("/b");
+		store.touch("/b");
+		const rows = store.list();
+		assert.deepEqual(rows.map((row) => row.path), ["/a", "/b"], "order is add order");
+		assert.equal(rows[1]!.lastUsedAt, 5000);
+		assert.equal(rows[0]!.lastUsedAt, undefined);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("saved workspaces: findSavedWorkspace resolves 1-based numbers and paths", () => {
+	const entries = [
+		{ path: "/a", addedAt: 1 },
+		{ path: "/b", addedAt: 2 },
+	];
+	assert.deepEqual(findSavedWorkspace(entries, "2")?.entry.path, "/b");
+	assert.equal(findSavedWorkspace(entries, "3"), undefined);
+	assert.equal(findSavedWorkspace(entries, "0"), undefined);
+	assert.deepEqual(findSavedWorkspace(entries, "/a/")?.index, 0);
+	assert.equal(findSavedWorkspace(entries, "/c"), undefined);
+	assert.equal(findSavedWorkspace(entries, ""), undefined);
+});
+
+test("saved workspaces: corrupt or legacy files never throw", () => {
+	const { dir, file } = tempWorkspaceFile();
+	try {
+		mkdirSync(join(dir, "state"), { recursive: true });
+		writeFileSync(file, "{ not json");
+		assert.deepEqual(createSavedWorkspaceStore(file).list(), []);
+
+		// Legacy bare-array format is still readable.
+		writeFileSync(
+			file,
+			JSON.stringify([{ path: "/legacy", addedAt: 7 }, { nope: true }, { path: "  " }]),
+		);
+		const rows = createSavedWorkspaceStore(file).list();
+		assert.equal(rows.length, 1);
+		assert.equal(rows[0]!.path, "/legacy");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});

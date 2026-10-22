@@ -15,6 +15,8 @@ import {
 	modeCard,
 	questionCard,
 	resumeCard,
+	helpCard,
+	workspaceListCard,
 	AGENT_PRESETS,
 } from "../../../src/presentation/cards.ts";
 
@@ -258,4 +260,72 @@ test("resumeCard: relative times, titles, current-session row disabled, empty st
 
 	const empty = resumeCard([], undefined, { now: () => now });
 	assert.match(JSON.stringify(empty), /暂无历史会话/);
+});
+
+// ---- unified help card + saved-workspace picker ----------------------------
+
+function buttonValues(card: unknown): Array<Record<string, unknown>> {
+	return collectButtons(card).map(
+		(btn) =>
+			((btn.behaviors as Array<{ value?: Record<string, unknown> }> | undefined)?.[0]
+				?.value ?? {}) as Record<string, unknown>,
+	);
+}
+
+test("/help 卡片由统一帮助目录生成，并带可点按钮（回调复用现有 op）", () => {
+	const card = helpCard() as Json;
+	assert.equal(card.schema, "2.0");
+	// Wording comes from src/help/catalog.ts (Feishu view): the new commands
+	// must be discoverable from the card, not only from WeChat.
+	const body = card.body as Json;
+	const text = JSON.stringify(body);
+	for (const command of ["/lark", "/ws", "/cd", "/goal", "/doctor", "/lark-config", "/sessions"]) {
+		assert.ok(text.includes(command), `help card must document ${command}`);
+	}
+	const ops = buttonValues(card).map((value) => value.op);
+	assert.deepEqual(ops, ["status", "workspace", "mode", "doctor"]);
+});
+
+test("workspaceListCard: empty list explains how to add, no dead buttons", () => {
+	const card = workspaceListCard([], { current: "/Users/me/app" }) as Json;
+	assert.equal(card.schema, "2.0");
+	const body = card.body as Json;
+	const text = JSON.stringify(body);
+	assert.ok(text.includes("/Users/me/app"));
+	assert.ok(text.includes("/ws add"));
+	assert.equal(collectButtons(card).length, 0);
+});
+
+test("workspaceListCard: one switch button per entry carrying workspace:<path>", () => {
+	const entries = [
+		{ path: "/Users/me/app-a" },
+		{ path: "D:\\work\\app b", label: "app-b" },
+	];
+	const card = workspaceListCard(entries, {
+		current: "/Users/me/app-a",
+		currentLabel: "当前工作区",
+	}) as Json;
+	const values = buttonValues(card);
+	assert.equal(values.length, 2);
+	assert.deepEqual(
+		values.map((value) => value.op),
+		["workspace:/Users/me/app-a", "workspace:D:\\work\\app b"],
+	);
+	// Same split the host's card-action dispatcher uses (first colon only):
+	// a Windows drive letter must NOT be mistaken for a command separator.
+	const second = String(values[1]!.op);
+	const sep = second.indexOf(":");
+	assert.equal(second.slice(0, sep), "workspace");
+	assert.equal(second.slice(sep + 1), "D:\\work\\app b");
+	// Visible text lists the numbered paths and uses the supplied label.
+	const text = JSON.stringify(card);
+	assert.ok(text.includes("#1"));
+	assert.ok(text.includes("#2 app-b"));
+	assert.ok(text.includes("当前工作区"));
+});
+
+test("statusCard 仍然带按钮（诊断包 / 命令面板 / 工作区）", () => {
+	const card = statusCard("connected", ["line"]) as Json;
+	const ops = buttonValues(card).map((value) => value.op);
+	assert.deepEqual(ops, ["help", "workspace", "doctor"]);
 });

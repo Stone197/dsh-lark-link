@@ -6,6 +6,7 @@
 // emoji 精简为稳定集合（部分 emoji 在部分客户端字体渲染乱码）。
 
 import type { AgentPresetOption } from "../common/types.ts";
+import { feishuHelpCatalog } from "../help/catalog.ts";
 
 export type CardVariant = "status" | "help" | "setup" | "welcome" | "error";
 
@@ -407,27 +408,113 @@ export function resumeCard(
 	};
 }
 
+/**
+ * `/help` — generated from the unified catalog (`src/help/catalog.ts`,
+ * Feishu view), so the card and the WeChat listing can never disagree.
+ *
+ * Buttons reuse the EXISTING card-action path: each `op` is the bare bridge
+ * command the router already dispatches (`status`, `workspace`, `mode`,
+ * `doctor`), so a click lands in `bridgeHandler` exactly like typing the
+ * command. No new callback surface is introduced here.
+ */
 export function helpCard(): unknown {
-	return markdownCard(
+	const catalog = feishuHelpCatalog();
+	const lines: string[] = ["**可用命令**（点按钮或直接输入）", ""];
+	for (const group of catalog.groups) {
+		const entries = catalog.commands.filter((entry) => entry.group === group.id);
+		if (entries.length === 0) continue;
+		lines.push(`**${group.title}**`);
+		for (const entry of entries) {
+			lines.push(`- \`${entry.command}\` ${entry.summary}`);
+		}
+		lines.push("");
+	}
+	lines.push(catalog.footer);
+	return withButtons(
+		markdownCard(lines.join("\n"), { header: "Lark Link 帮助", accent: true }),
 		[
-			"**可用命令**（点按钮或直接输入）",
-			"",
-			"- `/status` 桥接状态",
-			"- `/mode` 切换 Agent 模式（标准/PTC/极简/创造）",
-			"- `/permission` 切换权限（只读/工作区写/Full access）",
-			"- `/new` 当前工作区新起会话",
-			"- `/resume` 恢复当前工作区的历史会话",
-			"- `/workspace <路径>` 切换工作区（`~` 可用）",
-			"- `/stop` 停止当前会话任务",
-			"- `/doctor` 生成诊断包（含 session log）",
-			"- `/model` 查看/切换模型",
-			"- `/lark-config k=v` 热改配置（嵌套键如 `streaming.enabled=true`）",
-			"- `/lark setup|start|stop|status` 桥接管理",
-			"- `/goal` 等 DSH 命令原样执行",
-			"- skill 无需前缀：直接说任务（如「用 X skill 做 Y」）",
-		].join("\n"),
-		{ header: "Lark Link 帮助", accent: true },
+			button("桥接状态", { op: "status" }),
+			button("工作区", { op: "workspace" }),
+			button("切换模式", { op: "mode" }),
+			button("诊断包", { op: "doctor" }),
+		],
 	);
+}
+
+/** One saved workspace row rendered by {@link workspaceListCard}. */
+export interface WorkspaceCardEntry {
+	/** Absolute path — also the value the button switches to. */
+	path: string;
+	/** Optional display name (basename when omitted). */
+	label?: string;
+}
+
+/** Last path segment, tolerating both separators (no node:path in a card). */
+function basenameOf(path: string): string {
+	const parts = path.split(/[\\/]+/).filter(Boolean);
+	return parts[parts.length - 1] ?? path;
+}
+
+/**
+ * `/ws list` — the saved-workspace picker card.
+ *
+ * Every row is a BUTTON whose `op` is `workspace:<path>`: that is the existing
+ * bridge command, so a click is dispatched by the current card-action handler
+ * without any new callback code in the host. Paths carry colons on Windows
+ * (`D:\…`) and the dispatcher splits `op` at the FIRST `:`, so the path
+ * survives intact.
+ */
+export function workspaceListCard(
+	entries: ReadonlyArray<WorkspaceCardEntry>,
+	opts: { current?: string; currentLabel?: string } = {},
+): unknown {
+	const currentLabel = opts.currentLabel ?? "当前工作区";
+	const elements: unknown[] = [
+		{
+			tag: "markdown",
+			content: opts.current
+				? `**${currentLabel}**: ${opts.current}`
+				: "**当前工作区**: 发送 `/cd` 查看（本卡片用于切换收藏）",
+		},
+	];
+	if (entries.length === 0) {
+		elements.push({
+			tag: "markdown",
+			content:
+				"（暂无收藏工作区）\n\n发送 `/ws add /绝对路径` 收藏一个目录，之后就能在这里一键切换。",
+		});
+	} else {
+		elements.push({
+			tag: "markdown",
+			content: "**收藏工作区**（点按钮即切换；编号用于 `/ws use`、`/ws remove`）",
+		});
+		entries.forEach((entry, index) => {
+			const name = entry.label ?? basenameOf(entry.path);
+			elements.push({
+				tag: "markdown",
+				content: `#${index + 1} ${name} — ${entry.path}`,
+			});
+			elements.push(
+				button(`#${index + 1} ${name}`, {
+					op: `workspace:${entry.path}`,
+					path: entry.path,
+				}),
+			);
+		});
+	}
+	elements.push({
+		tag: "markdown",
+		content:
+			"`/ws add 路径` 收藏 · `/ws use 编号` 切换 · `/ws remove 编号` 删除 · `/cd 路径` 直接切换",
+	});
+	return {
+		schema: "2.0",
+		header: {
+			title: { tag: "plain_text", content: "收藏工作区" },
+			template: "blue",
+		},
+		body: { elements },
+	};
 }
 
 /** Welcome card with one-click buttons (schema 2.0 平铺按钮). */
@@ -481,7 +568,14 @@ export function commandPanelCard(): unknown {
 	};
 }
 
-/** Status card with a doctor button. */
+/**
+ * `/status` — status text plus one-click follow-ups.
+ *
+ * The buttons reuse the existing bridge commands (`help`, `workspace`,
+ * `doctor`) so they dispatch through the same card-action callback as every
+ * other card; the host keeps a plain-text reply as the fallback if sending the
+ * card fails (card delivery can be rejected independently of the text lane).
+ */
 export function statusCard(
 	statusText: string,
 	detailLines: string[] = [],
@@ -492,6 +586,8 @@ export function statusCard(
 			elements: [
 				{ tag: "markdown", content: `**状态**\n${statusText}` },
 				...detailLines.map((line) => ({ tag: "markdown", content: line })),
+				button("命令面板", { op: "help" }),
+				button("工作区", { op: "workspace" }),
 				button("诊断包", { op: "doctor" }),
 			],
 		},

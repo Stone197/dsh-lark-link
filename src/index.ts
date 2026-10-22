@@ -68,6 +68,7 @@ import {
 	modeCard,
 	modelCard,
 	permissionCard,
+	statusCard,
 	questionCard,
 	resumeCard,
 	withButtons,
@@ -109,7 +110,9 @@ import {
 	existsSync,
 } from "node:fs";
 import { zstdDecompressSync } from "node:zlib";
+import { randomBytes } from "node:crypto";
 import type { FeishuInboundMessage } from "./common/types.ts";
+import { createStopCallbackAuth } from "./outbound/run-callback.ts";
 
 export const name = "dsh-lark-link";
 export const inject = [
@@ -588,7 +591,16 @@ export function apply(ctx: Context, rawConfig: unknown): void {
 						await sender.sendCard(chatId, payload.card);
 					else await sender.sendText(chatId, payload.text);
 				} else if (payload.kind === "card") {
-					await sender.sendCard(chatId, payload.card);
+					// A card can be rejected independently of the text lane
+					// (missing CardKit scope, unsupported element, size). The
+					// enqueued card payload carries the equivalent plain text
+					// so a command reply is never lost — no retry loop needed.
+					try {
+						await sender.sendCard(chatId, payload.card);
+					} catch (err) {
+						if (payload.text) await sender.sendText(chatId, payload.text);
+						else throw err;
+					}
 				} else if (payload.kind === "media") {
 					await sender.sendFile(chatId, payload.fileKey, payload.type);
 				} else if (payload.kind === "reaction") {
@@ -622,6 +634,16 @@ export function apply(ctx: Context, rawConfig: unknown): void {
 	// the whole turn (a fresh one per chunk would create a card per chunk);
 	// a disposed handle (finalized / errored) is replaced on next access.
 	const streamHandles = new Map<string, CardKitStreamHandle>();
+	// Whole-card run-view handles (bridge interaction parity). Kept in a
+	// separate map from streamHandles: the legacy stream map is cleared on
+	// key rotation, while a run card must survive until its turn/end finalize.
+	const runCardHandles = new Map<string, CardKitStreamHandle>();
+	// HMAC key for the run card's ⏹ stop button. Per-process secret: tokens are
+	// invalidated by a restart, which matches the 1-turn lifetime of a run card.
+	// Not the Feishu app secret — that is async-loaded and never needed here.
+	const runStopAuth = createStopCallbackAuth({
+		secret: randomBytes(32).toString("base64url"),
+	});
 	// One-time per conversation: tell the user WHY streaming fell back to a
 	// plain reply (silent fallback reads as "卡片功能无法开启"). Content is
 	// never lost — the forwarder degrades to the durable outbox — this notice
@@ -655,6 +677,51 @@ export function apply(ctx: Context, rawConfig: unknown): void {
 					"常见排查：应用未开通 CardKit 卡片权限（cardkit:card）、飞书客户端版本过旧、或 stream 文本超限。错误只提示一次。",
 			)
 			.catch(() => undefined);
+	};
+	// Shared CardKit handle factory — legacy text stream and the whole-card run
+	// view use identical API plumbing; only their maps/consumers differ.
+	const makeCardKitHandle = (
+		sessionKey: string,
+		route: { chatId: string },
+	): CardKitStreamHandle | undefined => {
+		const client = getLarkClient();
+		if (!client?.cardkitCreateCard || !client.cardkitDeliverCard || !client.cardkitUpdateCard)
+			return undefined;
+		const cfgStream = getCfg().streaming;
+		return createCardKitStream({
+			api: {
+				createCard: async (payload) => {
+					try {
+						return await client.cardkitCreateCard!(payload);
+					} catch (err) {
+						notifyCardkitFailure(sessionKey, err);
+						throw err;
+					}
+				},
+				deliverCard: (cardId) =>
+					client.cardkitDeliverCard!({
+						chatId: route.chatId,
+						cardId,
+					}),
+				streamText: (cardId, elementId, body) =>
+					client.cardkitStreamText!(cardId, elementId, body),
+				patchSettings: (cardId, body) =>
+					client.cardkitPatchSettings!(cardId, body),
+				updateCard: (cardId, body) =>
+					client.cardkitUpdateCard!(cardId, body),
+			},
+			printFrequencyMs: cfgStream.printFrequencyMs,
+			printStep: cfgStream.printStep,
+			minPushIntervalMs: 800,
+			onError: (err) => {
+				const errStr = String(err);
+				if (!errStr.includes("230020") && !errStr.includes("rate limit")) {
+					logger.warn(
+						`cardkit stream error for ${sessionKey}: ${err instanceof Error ? err.message : String(err)}`,
+					);
+				}
+			},
+		});
 	};
 	const taskCardSyncer = createTaskCardSyncer({
 		api: {
@@ -709,48 +776,19 @@ export function apply(ctx: Context, rawConfig: unknown): void {
 					threadMessageId: route.threadMessageId,
 				},
 				ensureStream: () => {
-					const client = getLarkClient();
-					if (!client?.cardkitCreateCard || !client.cardkitDeliverCard)
-						return undefined; // CardKit unavailable → chunks stay preview-only
 					const existing = streamHandles.get(sessionKey);
 					if (existing && !existing.disposed) return existing;
 					streamHandles.delete(sessionKey);
-					const cfgStream = getCfg().streaming;
-					const handle = createCardKitStream({
-						api: {
-							createCard: async (payload) => {
-								try {
-									return await client.cardkitCreateCard!(payload);
-								} catch (err) {
-									notifyCardkitFailure(sessionKey, err);
-									throw err;
-								}
-							},
-							deliverCard: (cardId) =>
-								client.cardkitDeliverCard!({
-									chatId: route.chatId,
-									cardId,
-								}),
-							streamText: (cardId, elementId, body) =>
-								client.cardkitStreamText!(cardId, elementId, body),
-							patchSettings: (cardId, body) =>
-								client.cardkitPatchSettings!(cardId, body),
-							updateCard: (cardId, body) =>
-								client.cardkitUpdateCard!(cardId, body),
-						},
-						printFrequencyMs: cfgStream.printFrequencyMs,
-						printStep: cfgStream.printStep,
-						minPushIntervalMs: 800,
-						onError: (err) => {
-							const errStr = String(err);
-							if (!errStr.includes("230020") && !errStr.includes("rate limit")) {
-								logger.warn(
-									`cardkit stream error for ${sessionKey}: ${err instanceof Error ? err.message : String(err)}`,
-								);
-							}
-						},
-					});
-					streamHandles.set(sessionKey, handle);
+					const handle = makeCardKitHandle(sessionKey, route);
+					if (handle) streamHandles.set(sessionKey, handle);
+					return handle;
+				},
+				ensureRunStream: () => {
+					const existing = runCardHandles.get(sessionKey);
+					if (existing && !existing.disposed) return existing;
+					runCardHandles.delete(sessionKey);
+					const handle = makeCardKitHandle(sessionKey, route);
+					if (handle) runCardHandles.set(sessionKey, handle);
 					return handle;
 				},
 
@@ -770,7 +808,25 @@ export function apply(ctx: Context, rawConfig: unknown): void {
 				markDone: () => bridge.markDone(sessionKey, route.lastMessageId),
 			};
 		},
-		cfg: () => ({ streamingEnabled: getCfg().streaming.enabled }),
+		cfg: () => ({
+			// Legacy text streaming and the whole-card run view are independent
+			// switches; either one being ON enables CardKit chunk previews.
+			streamingEnabled:
+				getCfg().streaming.enabled || getCfg().streaming.runCard,
+			runCardEnabled: getCfg().streaming.runCard,
+		}),
+		// ⏹ stop button on the run card: sign with a per-process HMAC secret so
+		// a forged/replayed card.action.trigger can't stop another chat's run.
+		stopCallbackToken: (route) => {
+			try {
+				return runStopAuth.sign({
+					sessionKey: route.sessionKey,
+					chatId: route.chatId,
+				});
+			} catch {
+				return undefined;
+			}
+		},
 		// Durable output enqueued → the triggering user request has been
 		// answered, so it won't be re-triggered after a crash. Best-effort.
 		onDelivered: (sessionKey) => {
@@ -947,6 +1003,7 @@ export function apply(ctx: Context, rawConfig: unknown): void {
 		cmdName: string,
 		msg: FeishuInboundMessage,
 		textOrCard: string | unknown,
+		fallbackText?: string,
 	): Promise<void> => {
 		const key = bridge.conversationKeyFor(msg);
 		await outbox.enqueue({
@@ -961,7 +1018,11 @@ export function apply(ctx: Context, rawConfig: unknown): void {
 			payload:
 				typeof textOrCard === "string"
 					? { kind: "text", text: textOrCard }
-					: { kind: "card", card: textOrCard as never },
+					: {
+							kind: "card",
+							card: textOrCard as never,
+							...(fallbackText ? { text: fallbackText } : {}),
+						},
 		});
 	};
 
@@ -971,14 +1032,14 @@ export function apply(ctx: Context, rawConfig: unknown): void {
 		msg: FeishuInboundMessage,
 	): Promise<boolean> => {
 		switch (name) {
-			case "status":
-				await durableReply(name, 
-					msg,
-					formatStatusLine(status.get()) +
-						"\n\n" +
-						statusDetailLines(status.get()).join("\n"),
-				);
+			case "status": {
+				const st = status.get();
+				const statusText = formatStatusLine(st);
+				const statusDetails = statusDetailLines(st);
+				const plain = statusText + "\n\n" + statusDetails.join("\n");
+				await durableReply(name, msg, statusCard(statusText, statusDetails), plain);
 				return true;
+			}
 			case "feishu-config":
 			case "lark-config": {
 				// /lark-config key=value — hot reload (no value shows status).
@@ -1707,6 +1768,21 @@ export function apply(ctx: Context, rawConfig: unknown): void {
 				"";
 			const messageId = raw.message?.message_id ?? "";
 			if (!op) return;
+			// Run-card ⏹ stop callback: verify the HMAC token before honouring.
+			// The button value carries {op:"stop", run_cb:true, token}; a forged
+			// or replayed click is dropped here. Cards rendered before signing
+			// was wired carry no token and still work via the /stop path.
+			if (value.run_cb === true && typeof value.token === "string") {
+				const known = routeStore.all().find((r) => r.chatId === chatId);
+				const verified = runStopAuth.verify(value.token, {
+					sessionKey: known?.sessionKey,
+					chatId,
+				});
+				if (!verified.ok) {
+					logger.warn(`run stop callback rejected: ${verified.reason}`);
+					return;
+				}
+			}
 			// op may be "name" (bare command) or "name:input" (picker callback).
 			// Single-select answer: "uqa:<questionId>:<optionIndex>".
 			// Multi-select answer: form submit op "uqam:<questionId>" — the
@@ -2026,6 +2102,7 @@ export function apply(ctx: Context, rawConfig: unknown): void {
 			if (event.type === "turn/end") {
 				turnSupervisor.disarm(key);
 				streamHandles.delete(key);
+				runCardHandles.delete(key);
 				const reason = event.reason;
 				// "aborted" is user cancellation via /stop or supervisor cancel — NOT an unhandled failure.
 				// Do not emit error diagnostic or reset session on "aborted".
@@ -2925,7 +3002,13 @@ export function apply(ctx: Context, rawConfig: unknown): void {
 	// owns its own storage (~/.dsh-wechat by default) and keeps the existing
 	// login/token, so upgrading from standalone dsh-wechat needs no re-scan.
 	const wechatCfg = cfg?.wechat;
-	if (wechatCfg?.enabled !== false) {
+	// The WeChat channel owns HTTP routes (/wechat/api/*, QR page) for its
+	// settings page, so it only starts when the host mounted a web server.
+	// This also keeps pure-Feishu harnesses (and the integration smoke ctx)
+	// free of WeChat timers/long-poll handles.
+	const hostHasHttpSurface =
+		(ctx as unknown as { webServer?: unknown }).webServer !== undefined;
+	if (wechatCfg?.enabled !== false && hostHasHttpSurface) {
 		let disposeWechat: (() => void | Promise<void>) | undefined;
 		try {
 			disposeWechat = applyWechatChannel(ctx, wechatCfg ?? {});

@@ -1,12 +1,15 @@
-// dsh-lark-link client half (browser).
-// Reusable management console injected into DSH Settings and Plugin Details:
-//   - settings.section ('lark-link')
+// dsh-lark-link client half (browser) — ONE bundle for BOTH IM channels.
+// Reusable management consoles injected into DSH Settings and Plugin Details:
+//   - settings.section ('lark-link', order 25)   → LarkSettingsConsole
+//   - settings.section ('wechat', order 40)      → WechatSection
+//     (ported verbatim from pan17/dsh-wechat; see ./wechat-section.ts)
 //   - plugins.bundle.config ('dsh-lark-link')
 //   - plugins.row.config ('dsh-lark-link#lark-link')
 //
 // Left sidebar footer action has been removed per UX redesign.
 
 import type { Context } from "@deepseek-ai/cordis";
+import { WechatSection } from "./wechat-section.ts";
 
 type ReactApi = {
 	createElement: (
@@ -1038,4 +1041,31 @@ export function apply(ctx: ClientContext): void {
 		);
 		return dispose;
 	});
+
+	// 4. Settings section: WeChat panel (order 40), ported from dsh-wechat.
+	// Park the registration on the plugin's fiber: dropping the disposer leaves
+	// the panel registered after unload, and re-registering on the next load
+	// would stack a duplicate entry. `ctx.effect` is the documented owner; the
+	// plain call stays as a fallback for an older client kernel.
+	const register = () =>
+		ctx.slots.inject("settings.section", () => {
+			const dispose = ctx.slots.register(
+				{
+					name: "settings.section",
+					id: "wechat",
+					order: 40,
+					label: "WeChat",
+				},
+				WechatSection,
+			);
+			return dispose;
+		});
+	if (ctx.effect) {
+		// @ts-expect-error — this client-side `slots.inject` is typed void while
+		// the kernel's effect body may return a disposer; the runtime shapes
+		// match (both hand back the slot disposer).
+		ctx.effect(register);
+	} else {
+		register();
+	}
 }
