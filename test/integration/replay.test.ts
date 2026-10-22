@@ -39,7 +39,14 @@ function buildBridge(
     autoReply?: (key: string, text: string) => string;
   } = {},
 ) {
-  const configStore = createConfigStore(dir, { groupPolicy: "open" });
+  // Inbound merge is disabled here: the merge path journals the WAL record at
+  // FLUSH time (one merged record), while this suite asserts the legacy
+  // accept-before-enqueue contract and sub-second replay timing. Merge WAL
+  // semantics are covered by test/unit/application/message-handler-merge.test.ts.
+  const configStore = createConfigStore(dir, {
+    groupPolicy: "open",
+    inboundMerge: { enabled: false },
+  });
   const status = createStatusStore(join(dir, "status.json"));
   const routeStore = createRouteStore(join(dir, "routes.json"));
   const logger = createLogger("it-replay");

@@ -28,6 +28,40 @@ function getTokenPath(storageDir: string): string {
   return path.join(getAuthDir(storageDir), "token.json");
 }
 
+/** Thrown when plugin dispose / relogin cancels the QR login flow. */
+function abortError(): Error {
+  const err = new Error("login aborted");
+  err.name = "AbortError";
+  return err;
+}
+
+/**
+ * Sleep that also honours an abort signal.
+ *
+ * The QR loop waits 1.5s between polls. A plain `setTimeout` would (a) keep
+ * the process alive for up to that delay after the plugin is disposed and
+ * (b) make `bridge.stop()` — which AWAITS the login task — take that long.
+ * `unref()` + abort listener keep dispose bounded to a microtask.
+ */
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(abortError());
+      return;
+    }
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      reject(abortError());
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    timer.unref?.();
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 export function loadToken(storageDir: string): TokenData | null {
   const tokenPath = getTokenPath(storageDir);
   if (!fs.existsSync(tokenPath)) return null;
@@ -54,12 +88,15 @@ export async function login(params: {
   storageDir: string;
   log: (msg: string) => void;
   renderQrUrl?: (url: string) => void;
+  /** Cancels the QR poll when the plugin is disposed / a relogin supersedes it. */
+  signal?: AbortSignal;
 }): Promise<TokenData> {
-  const { baseUrl, botType, storageDir, log, renderQrUrl } = params;
+  const { baseUrl, botType, storageDir, log, renderQrUrl, signal } = params;
 
   log("Starting WeChat QR login...");
 
-  const qrResp = await getBotQrcode({ baseUrl, botType });
+  if (signal?.aborted) throw abortError();
+  const qrResp = await getBotQrcode({ baseUrl, botType, abortSignal: signal });
   const qrcodeUrl = qrResp.qrcode_img_content;
 
   log("Please scan the QR code with WeChat:");
@@ -74,7 +111,8 @@ export async function login(params: {
   let refreshCount = 0;
 
   while (Date.now() < deadline) {
-    const statusResp = await getQrcodeStatus({ baseUrl, qrcode: currentQrcode });
+    if (signal?.aborted) throw abortError();
+    const statusResp = await getQrcodeStatus({ baseUrl, qrcode: currentQrcode, abortSignal: signal });
 
     switch (statusResp.status) {
       case "wait":
@@ -88,7 +126,7 @@ export async function login(params: {
           throw new Error("QR code expired multiple times, please retry");
         }
         log(`QR expired, refreshing (${refreshCount}/3)...`);
-        const newQr = await getBotQrcode({ baseUrl, botType });
+        const newQr = await getBotQrcode({ baseUrl, botType, abortSignal: signal });
         currentQrcode = newQr.qrcode;
         if (renderQrUrl) {
           renderQrUrl(newQr.qrcode_img_content);
@@ -113,7 +151,7 @@ export async function login(params: {
       }
     }
 
-    await new Promise((r) => setTimeout(r, 1500));
+    await sleep(1500, signal);
   }
 
   throw new Error("Login timeout (5 minutes)");

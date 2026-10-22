@@ -118,6 +118,17 @@ import {
   type StagedReference,
 } from "./at-refs.ts";
 
+/**
+ * Mark a timer as non-blocking for process exit. Every timer here is either
+ * cleared on dispose or purely bookkeeping; `unref()` means a forgotten one
+ * can delay neither host shutdown nor a test run. (Node's `keepAlive` typing
+ * is a `setInterval`, hence the structural shape.)
+ */
+function unrefTimer<T extends { unref?: () => void }>(timer: T): T {
+  timer.unref?.();
+  return timer;
+}
+
 /** WeChat gateway continuous-message limit per user interaction window. */
 const MSG_LIMIT_MAX = 10;
 const MSG_LIMIT_WARN = 7;
@@ -557,6 +568,15 @@ export class WeChatDSHBridge {
   private monitorAbort: AbortController | null = null;
   private monitorRunning = false;
   private monitorTask: Promise<void> | null = null;
+  /**
+   * QR-login cancellation + task, tracked symmetrically with the monitor so
+   * `stop()` can abort an in-flight login and AWAIT its exit instead of
+   * leaving a 5-minute QR poll (and its sleeps/fetches) alive after plugin
+   * unload. Without this a reload during扫码 left the login loop running and
+   * it could start a monitor on a disposed bridge.
+   */
+  private loginAbort: AbortController | null = null;
+  private loginTask: Promise<void> | null = null;
   private readonly seenInbound = new Map<string, number>();
   private loginState: LoginState = { phase: "idle" };
   /** Pending question cards per user (rpcId-keyed, first = active). */
@@ -1306,19 +1326,19 @@ export class WeChatDSHBridge {
     // clearTimeout(stale) + setTimeout(new) to refresh it. endTyping clears
     // the latest one via `active.safetyTimer`; if a tick has already swapped
     // in a newer handle, `clearTimeout` on the stale one is a no-op.
-    let safetyTimer: NodeJS.Timeout = setTimeout(() => {
+    let safetyTimer: NodeJS.Timeout = unrefTimer(setTimeout(() => {
       this.endTyping(userId, "safety-timeout");
-    }, TYPING_SAFETY_TIMEOUT_MS);
+    }, TYPING_SAFETY_TIMEOUT_MS));
     const refreshSafetyTimer = (): void => {
       clearTimeout(safetyTimer);
-      safetyTimer = setTimeout(() => {
+      safetyTimer = unrefTimer(setTimeout(() => {
         this.endTyping(userId, "safety-timeout");
-      }, TYPING_SAFETY_TIMEOUT_MS);
+      }, TYPING_SAFETY_TIMEOUT_MS));
     };
-    const keepAliveTimer = setInterval(() => {
+    const keepAliveTimer = unrefTimer(setInterval(() => {
       void this.sendTypingStatus(userId, TypingStatus.TYPING);
       refreshSafetyTimer();
-    }, TYPING_KEEPALIVE_MS);
+    }, TYPING_KEEPALIVE_MS));
     this.typingActive.set(userId, {
       sessionId,
       startedAt: Date.now(),
@@ -1354,7 +1374,52 @@ export class WeChatDSHBridge {
     } else {
       // No bot token: the next QR login may be a different WeChat account.
       this.resetPeerBinding("start-without-token");
-      void this.startLoginFlow();
+      this.beginLogin();
+    }
+  }
+
+  /**
+   * Start (or replace) the QR-login flow and keep its task so `stop()` can
+   * abort it and wait for it to exit. Re-entrant: a second call (relogin while
+   * the first QR is still on screen) cancels the previous attempt first, so
+   * only one login loop ever polls the gateway.
+   */
+  private beginLogin(): void {
+    this.loginAbort?.abort();
+    const abort = new AbortController();
+    this.loginAbort = abort;
+    const task = this.startLoginFlow(abort.signal).finally(() => {
+      if (this.loginAbort === abort) this.loginAbort = null;
+      if (this.loginTask === task) this.loginTask = null;
+    });
+    this.loginTask = task;
+  }
+
+  /**
+   * Wait for the QR-login task to exit after an abort, but NEVER block dispose
+   * forever: an injected/mocked `login()` (or a host whose fetch ignores the
+   * signal) may never settle. The real login loop takes the abort into its
+   * sleeps and QR fetches and exits in a microtask, so the grace window is
+   * only a safety net.
+   */
+  private async awaitLoginExit(graceMs = 1000): Promise<void> {
+    const task = this.loginTask;
+    if (!task) return;
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        task,
+        new Promise<void>((resolve) => {
+          timer = unrefTimer(setTimeout(resolve, graceMs));
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+    if (this.loginTask) {
+      console.warn(
+        `[dsh-wechat] QR login did not exit within ${graceMs}ms after abort; abandoning it`,
+      );
     }
   }
 
@@ -1372,6 +1437,11 @@ export class WeChatDSHBridge {
    */
   async stop(): Promise<void> {
     this.stopIlink("plugin-stop");
+    // Cancel an in-flight QR login too (plugin unload / host shutdown must not
+    // leave a 5-minute poll alive). The await below is bounded: the login loop
+    // takes the abort signal into its sleeps and QR fetches.
+    this.loginAbort?.abort();
+    this.loginAbort = null;
     // Deliver what 打字合并 is holding BEFORE `stopInteraction()`: the merged
     // batch is forwarded through `forwardToAgent`, which aborts as soon as the
     // interaction is marked stopped — flushing afterwards would silently
@@ -1399,6 +1469,7 @@ export class WeChatDSHBridge {
     // `flushPendingFinal` already swallows a send failure per session, so a
     // broken gateway cannot turn dispose into a rejection.
     await this.flushAllPendingFinal("dispose");
+    await this.awaitLoginExit();
     await this.monitorTask;
     // Release the audit descriptor last: everything above can still record.
     this.audit.close();
@@ -1431,7 +1502,7 @@ export class WeChatDSHBridge {
       return { ok: true, message: `已重连 (Bot: ${this.token.accountId})` };
     }
     this.resetPeerBinding("reconnect-without-token");
-    void this.startLoginFlow();
+    this.beginLogin();
     return { ok: true, message: "未找到登录令牌，已开始扫码登录" };
   }
 
@@ -1447,7 +1518,7 @@ export class WeChatDSHBridge {
     this.loginState = { phase: "idle" };
     this.discardQueuedOutbound("relogin");
     this.resetPeerBinding("relogin");
-    void this.startLoginFlow();
+    this.beginLogin();
     return { ok: true, message: "已开始重新扫码登录" };
   }
 
@@ -1534,15 +1605,17 @@ export class WeChatDSHBridge {
     }
   }
 
-  private async startLoginFlow(): Promise<void> {
+  private async startLoginFlow(signal: AbortSignal): Promise<void> {
     try {
       this.loginState = { phase: "waiting-qr" };
       const token = await login({
         baseUrl: this.config.baseUrl,
         botType: this.config.botType,
         storageDir: this.config.storageDir,
+        signal,
         log: (msg) => console.log(`[dsh-wechat] ${msg}`),
         renderQrUrl: (url) => {
+          if (signal.aborted) return;
           this.loginState = { ...this.loginState, phase: "waiting-qr", qrUrl: url };
           // Always log the URL: the web page at /wechat/qr is the primary
           // viewer, but a terminal user can open the link directly.
@@ -1555,6 +1628,9 @@ export class WeChatDSHBridge {
       this.loginState = { phase: "logged-in", botId: token.accountId };
       await this.startMonitor();
     } catch (err) {
+      // Dispose/reconnect cancellation is not a login failure: keep the
+      // state quiet instead of flashing "登录失败" for a deliberate abort.
+      if (signal.aborted) return;
       this.loginState = { phase: "failed", error: String(err) };
       console.error(`[dsh-wechat] login failed: ${String(err)}`);
     }
@@ -2765,7 +2841,7 @@ export class WeChatDSHBridge {
           this.notifiedCrossSessionTurns.set(r.userId, set);
           // Arm the cleanup for every path that marks, so a mark can never
           // outlive its 30s window without a timer to release it.
-          setTimeout(() => this.notifiedCrossSessionTurns.get(r.userId)?.delete(sessionId), 30_000);
+          unrefTimer(setTimeout(() => this.notifiedCrossSessionTurns.get(r.userId)?.delete(sessionId), 30_000));
           // 结论模式: fold this round's completion card into the task's hold
           // instead of emitting one card per auto-continued round.
           if (holdMode) {
@@ -3251,14 +3327,14 @@ export class WeChatDSHBridge {
       askedAt: Date.now(),
       settled: false,
       settleWechat,
-      timer: setTimeout(() => {
+      timer: unrefTimer(setTimeout(() => {
         if (card.settled) return;
         this.removeApprovalCard(userId, rpcId);
         void this.sendReply(
           userId,
           `⏰ 权限卡超时未回复（${toolName}），已移除；可在 DSH 界面继续处理。`,
         ).catch(() => {});
-      }, this.config.cardTimeoutMs),
+      }, this.config.cardTimeoutMs)),
     };
     const list = this.pendingApprovals.get(userId) ?? [];
     list.push(card);
@@ -3333,11 +3409,11 @@ export class WeChatDSHBridge {
       settled: false,
       settleWechat,
       cancelWechat,
-      timer: setTimeout(() => {
+      timer: unrefTimer(setTimeout(() => {
         if (card.settled) return;
         this.removeQuestionCard(userId, rpcId);
         void this.sendReply(userId, "⏰ 提问卡超时未回复，已移除；可在 DSH 界面继续回答。").catch(() => {});
-      }, this.config.cardTimeoutMs),
+      }, this.config.cardTimeoutMs)),
     };
     const list = this.pendingQuestions.get(userId) ?? [];
     list.push(card);
@@ -3412,13 +3488,13 @@ export class WeChatDSHBridge {
           askedAt: Date.now(),
           settled: false,
           settleWechat: null,
-          timer: setTimeout(() => {
+          timer: unrefTimer(setTimeout(() => {
             this.removeApprovalCard(userId, frame.rpcId);
             void this.sendReply(
               userId,
               `⏰ 权限卡超时未回复（${toolName}），已移除；可在 DSH 界面继续处理。`,
             ).catch(() => {});
-          }, this.config.cardTimeoutMs),
+          }, this.config.cardTimeoutMs)),
         };
         const list = this.pendingApprovals.get(userId) ?? [];
         list.push(card);
@@ -3462,10 +3538,10 @@ export class WeChatDSHBridge {
           settled: false,
           settleWechat: null,
           cancelWechat: null,
-          timer: setTimeout(() => {
+          timer: unrefTimer(setTimeout(() => {
             this.removeQuestionCard(userId, frame.rpcId);
             void this.sendReply(userId, "⏰ 提问卡超时未回复，已移除；可在 DSH 界面继续回答。").catch(() => {});
-          }, this.config.cardTimeoutMs),
+          }, this.config.cardTimeoutMs)),
         };
         const list = this.pendingQuestions.get(userId) ?? [];
         list.push(card);
@@ -3637,7 +3713,7 @@ export class WeChatDSHBridge {
       set.add(sessionId);
       this.notifiedCrossSessionTurns.set(user.userId, set);
       // Arm the cleanup for every path that marks.
-      setTimeout(() => { this.notifiedCrossSessionTurns.get(user.userId)?.delete(sessionId); }, 30_000);
+      unrefTimer(setTimeout(() => { this.notifiedCrossSessionTurns.get(user.userId)?.delete(sessionId); }, 30_000));
       // 结论模式: hold instead of one card per auto-continued round.
       if (holdMode) {
         this.foldFinalRound(sessionId);

@@ -10,6 +10,13 @@ import { createConversationManager } from "../../../src/sessions/conversation-ma
 import { createCommandRouter } from "../../../src/application/command-router.ts";
 import type { FeishuInboundMessage } from "../../../src/common/types.ts";
 
+/** Config with inbound merge OFF — these legacy tests assert immediate dispatch. */
+const NO_MERGE = {
+  ...DEFAULT_CONFIG,
+  reactions: { ...DEFAULT_CONFIG.reactions, enabled: false },
+  inboundMerge: { enabled: false, silenceMs: 1000 },
+};
+
 const mkMsg = (text: string, messageId = "m1", chatId = "ou_x"): FeishuInboundMessage => ({
   messageId,
   chatId,
@@ -26,7 +33,7 @@ const mkMsg = (text: string, messageId = "m1", chatId = "ou_x"): FeishuInboundMe
 test("message-handler: full pipeline routes plain message to agent", async () => {
   const ctx = createBridgeContext({
     logger: createLogger("test"),
-    cfg: () => DEFAULT_CONFIG,
+    cfg: () => NO_MERGE,
     status: createStatusStore(undefined),
   });
   const backend = createMemoryDshBackend({ autoReply: () => "ok" });
@@ -73,7 +80,7 @@ test("message-handler: full pipeline routes plain message to agent", async () =>
 test("message-handler: duplicate message dropped (dedupe)", async () => {
   const ctx = createBridgeContext({
     logger: createLogger("test"),
-    cfg: () => DEFAULT_CONFIG,
+    cfg: () => NO_MERGE,
     status: createStatusStore(undefined),
   });
   ctx.setConversations({ handleMessage: async () => {}, stop: async () => {}, keyFor: () => "k", sweep: () => 0, size: () => 0, keys: () => [], disposeAll: async () => {} } as never);

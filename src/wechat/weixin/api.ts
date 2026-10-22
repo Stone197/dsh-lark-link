@@ -190,16 +190,28 @@ function buildBaseInfo(): BaseInfo {
   return { channel_version: CHANNEL_VERSION };
 }
 
-async function apiGet<T>(baseUrl: string, path: string, token?: string): Promise<T> {
+async function apiGet<T>(
+  baseUrl: string,
+  path: string,
+  token?: string,
+  abortSignal?: AbortSignal,
+): Promise<T> {
   const url = `${baseUrl.replace(/\/$/, "")}/${path}`;
-  const res = await fetch(url, { headers: buildHeaders({ token }) });
+  const res = await fetch(url, {
+    headers: buildHeaders({ token }),
+    ...(abortSignal ? { signal: abortSignal } : {}),
+  });
   const text = await res.text();
   if (!res.ok) throw new Error(`HTTP ${res.status}: ${text}`);
   return JSON.parse(text) as T;
 }
 
 function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    // Retry backoff only; never keeps the process alive on its own.
+    timer.unref?.();
+  });
 }
 
 async function apiPost<T>(
@@ -381,16 +393,22 @@ export async function sendTyping(params: {
 export async function getBotQrcode(params: {
   baseUrl: string;
   botType?: string;
+  /** Cancels an in-flight request when the login flow is disposed. */
+  abortSignal?: AbortSignal;
 }): Promise<{ qrcode: string; qrcode_img_content: string }> {
   return apiGet(
     params.baseUrl,
     `ilink/bot/get_bot_qrcode?bot_type=${params.botType ?? "3"}`,
+    undefined,
+    params.abortSignal,
   );
 }
 
 export async function getQrcodeStatus(params: {
   baseUrl: string;
   qrcode: string;
+  /** Cancels an in-flight request when the login flow is disposed. */
+  abortSignal?: AbortSignal;
 }): Promise<{
   status: string;
   bot_token?: string;
@@ -401,6 +419,8 @@ export async function getQrcodeStatus(params: {
   return apiGet(
     params.baseUrl,
     `ilink/bot/get_qrcode_status?qrcode=${encodeURIComponent(params.qrcode)}`,
+    undefined,
+    params.abortSignal,
   );
 }
 

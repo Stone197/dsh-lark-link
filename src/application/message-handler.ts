@@ -360,6 +360,8 @@ export function createMessageHandler(deps: MessageHandlerDeps): MessageHandler {
 	// rebuilds the queue (any half-open window is dropped — rare, logged).
 	let mergeQueue: PendingQueue<QueuedInboundMessage> | undefined;
 	let mergeSilenceMs = -1;
+	/** Scopes paused before the queue was even created (turn already running). */
+	const pausedScopes = new Set<string>();
 
 	function queueFor(silenceMs: number): PendingQueue<QueuedInboundMessage> {
 		const delayMs = Math.max(0, Math.floor(silenceMs));
@@ -386,6 +388,8 @@ export function createMessageHandler(deps: MessageHandlerDeps): MessageHandler {
 				);
 			},
 		});
+		// Honor pauses requested before this lazy queue existed.
+		for (const scope of pausedScopes) mergeQueue.block(scope);
 		return mergeQueue;
 	}
 
@@ -587,15 +591,18 @@ export function createMessageHandler(deps: MessageHandlerDeps): MessageHandler {
 			await handle(msg, true);
 		},
 		pauseMerge(scope) {
+			pausedScopes.add(scope);
 			mergeQueue?.block(scope);
 		},
 		resumeMerge(scope) {
+			pausedScopes.delete(scope);
 			mergeQueue?.unblock(scope);
 		},
 		dispose() {
 			mergeQueue?.cancelAll();
 			mergeQueue = undefined;
 			mergeSilenceMs = -1;
+			pausedScopes.clear();
 		},
 	};
 }

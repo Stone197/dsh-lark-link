@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, "feat/**"]
   pull_request:
 
 permissions:
@@ -14,15 +14,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-          cache: npm
+          cache: pnpm
 
-      - run: npm ci
+      - run: pnpm install --frozen-lockfile --ignore-scripts
 
-      - run: npm run check
+      - run: pnpm run check
 
-      - run: npm test
+      # Feishu engine (node:test)
+      - run: pnpm run test
 
-      - run: npm run build
+      # WeChat channel (vitest)
+      - run: pnpm run test:wechat
+
+      - run: pnpm run build

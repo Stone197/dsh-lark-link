@@ -26,7 +26,14 @@ import { tempDir } from "../../src/common/dedupe-store.ts";
 
 test("integration: Feishu message → agent reply → durable Feishu delivery", async () => {
   const dir = tempDir("it-");
-  const configStore = createConfigStore(dir, { groupPolicy: "open" });
+  // Inbound merge is disabled here: this suite asserts an end-to-end reply
+  // within 800ms, while the merge queue deliberately waits `silenceMs` first.
+  // The merge behavior itself is covered by test/unit/application/
+  // message-handler-merge.test.ts.
+  const configStore = createConfigStore(dir, {
+    groupPolicy: "open",
+    inboundMerge: { enabled: false },
+  });
   const status = createStatusStore(join(dir, "status.json"));
   const routeStore = createRouteStore(join(dir, "routes.json"));
   const logger = createLogger("it");

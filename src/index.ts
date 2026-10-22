@@ -1745,6 +1745,9 @@ export function apply(ctx: Context, rawConfig: unknown): void {
 		ctx: bridge,
 		commands: dshCommands,
 		bridgeHandler,
+		// /cd, /ws status and /ws list show the conversation's own workspace
+		// override (falls back to the bridge default when unset).
+		workspaceRootFor: (key: string) => convCfg.get(key).workspaceRoot,
 	});
 
 	// Card action routing (schema 2.0 behaviors:[{type:"callback",value}]):
@@ -2084,6 +2087,9 @@ export function apply(ctx: Context, rawConfig: unknown): void {
 				turnDelivered.delete(key);
 				streamHandles.delete(key);
 				turnSupervisor.arm(key);
+				// Bridge parity: while a turn runs, keep collecting rapid
+				// messages but don't dispatch a merged batch mid-turn.
+				messageHandler.pauseMerge?.(key);
 			}
 			if (event.type === "assistant/chunk") {
 				if ((event.text ?? "").trim() !== "") turnSupervisor.arm(key);
@@ -2103,6 +2109,7 @@ export function apply(ctx: Context, rawConfig: unknown): void {
 				turnSupervisor.disarm(key);
 				streamHandles.delete(key);
 				runCardHandles.delete(key);
+				messageHandler.resumeMerge?.(key);
 				const reason = event.reason;
 				// "aborted" is user cancellation via /stop or supervisor cancel — NOT an unhandled failure.
 				// Do not emit error diagnostic or reset session on "aborted".
@@ -3049,6 +3056,9 @@ export function apply(ctx: Context, rawConfig: unknown): void {
 		return async () => {
 			clearInterval(sweep);
 			stopMediaSweeper();
+			// Drop any pending debounce batches so their timers don't outlive
+			// the plugin (and a late flush can't touch a torn-down bridge).
+			messageHandler.dispose?.();
 			await stopBridge();
 		};
 	});

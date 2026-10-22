@@ -150,3 +150,42 @@ test("config: autoReplayEnabled honors env DSH_LARK_AUTO_REPLAY over config", as
 		else process.env.DSH_LARK_AUTO_REPLAY = prev;
 	}
 });
+
+// ---- inbound merge (防抖合并) ------------------------------------------------
+
+test("config: inboundMerge defaults to enabled with a 1000ms quiet window", () => {
+	assert.deepEqual(DEFAULT_CONFIG.inboundMerge, { enabled: true, silenceMs: 1000 });
+	assert.ok(
+		HOT_RELOADABLE.includes("inboundMerge"),
+		"inboundMerge is hot-reloadable",
+	);
+});
+
+test("config: /lark-config inboundMerge.enabled=false patches only the nested key", () => {
+	const patch = buildHotReloadPatch("inboundMerge.enabled", false);
+	assert.deepEqual(patch, { inboundMerge: { enabled: false } });
+	const store = createConfigStore("/tmp/dsh-lark-config-merge-1");
+	store.update(patch);
+	const cfg = store.get();
+	assert.equal(cfg.inboundMerge.enabled, false);
+	assert.equal(
+		cfg.inboundMerge.silenceMs,
+		1000,
+		"siblings preserved by deep merge",
+	);
+});
+
+test("config: /lark-config inboundMerge.silenceMs=300 is hot-reloadable", () => {
+	const patch = buildHotReloadPatch("inboundMerge.silenceMs", 300);
+	assert.deepEqual(patch, { inboundMerge: { silenceMs: 300 } });
+	const store = createConfigStore("/tmp/dsh-lark-config-merge-2");
+	store.update(patch);
+	assert.equal(store.get().inboundMerge.silenceMs, 300);
+});
+
+test("config: unknown inboundMerge sub-key is rejected (typos never no-op)", () => {
+	assert.throws(
+		() => buildHotReloadPatch("inboundMerge.silence", 300),
+		/config key "inboundMerge.silence" is unknown/,
+	);
+});

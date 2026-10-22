@@ -1,5 +1,54 @@
 # Changelog
 
+## 0.7.0 — 单包双通道：bridge 式实时运行卡片 + 微信通道
+
+一个插件同时连接飞书与微信；飞书侧交互升级为 lark-coding-agent-bridge 同款的「一次运行一张实时卡片」。
+
+### Feature: 实时运行卡片（bridge 交互对齐，飞书）
+
+- **一轮一张 CardKit 2.0 卡片**：正文、思考、工具调用在同一张卡上流式更新；`turn/end` 关闭流式并落最终卡。卡片成功发送即视为本轮持久投递，不再重复发文本；最终卡失败自动回退 durable outbox，内容不丢。
+- **思考折叠面板**：运行中展开「🧠 思考中」，结束后收起为「思考完成，点击查看」（`assistant/message` reasoning block + `agent/assistant-stream` reasoning-delta 两路归一化）。
+- **工具调用面板**：✅/❌/⏳ + DSH 工具中文名 + 参数摘要 + 输入/输出代码块；字段 800 字、输出 1200 字、body 总长 2500 字三级截断。
+- **>3 工具自动折叠**：历史调用折叠为「☕ N 个工具调用（已结束）」，运行中始终保留最新一条展开。
+- **流式摘要 + footer 状态**：思考中 / 正在调用工具 / 正在输出 / 已完成；卡片摘要同步。
+- **卡片内 ⏹ 终止**：HMAC-SHA256 签名（TTL + sessionKey/chatId 绑定 + 一次性 nonce 防重放），`handleCardAction` 验签后才执行停止。
+- **配置**：`streaming.runCard`（默认 **true**）；CardKit 不可用时自动回退。旧 `streaming.enabled`（单 markdown 流式）保留且独立。
+
+### Feature: 入站防抖合并（飞书）
+
+- 同会话 1 秒静默窗口内的连续文本合并为一轮（`inboundMerge.enabled` / `inboundMerge.silenceMs`），Agent 运行中消息继续排队；命令与媒体消息直通。
+- WAL 只接受合并后的一条请求（messageId=最后一条、text=合并文本），`onDelivered` 语义保持不变。
+
+### Feature: 微信通道（移植自 pan17/dsh-wechat 0.13.3，MIT）
+
+- 完整移植 iLink 长轮询、扫码登录、文本/图片/文件/语音收发、`/merge` 打字合并、`/silent` 静默、`/final` 结论、`/notify` 跨会话推送、`/at` 引用、`/history`、`/flush`、`/surface`、`/stop`、`/next`、`/rq`、审批卡/提问卡双端同弹、`send_wechat` 工具。
+- 作为统一插件的 `applyWechatChannel(ctx, config)` 启动，共用插件 fiber 与生命周期；仅在宿主挂载 webServer 时启动。
+- 默认存储仍为 `~/.dsh-wechat`（token / sync-buf / state / config / audit 原样复用，升级无需重新扫码）；HTTP 前缀 `/wechat/api/*` 与设置页 section id `wechat` 保持不变。
+- 新增 `/cd` 别名（等价 `/workspace switch`）。
+
+### Feature: 统一设置页与帮助目录
+
+- 一个 client bundle 同时注册两个 `settings.section`：`lark-link`（order 25，飞书控制台）与 `wechat`（order 40，WeChat 面板，含扫码、6 个折叠配置组、指令帮助）。
+- `src/help/catalog.ts` 成为两端 `/help` 的唯一文案源（飞书卡片 + 微信两级文本），避免双份文案漂移。
+- `/help` `/status` `/ws list` 返回可点按钮卡片；`/status` 卡片发送失败自动回退纯文本。
+
+### Feature: 工作空间管理（飞书）
+
+- `/cd <路径>`：与 `/workspace` 完全等价（`~`、相对路径、per-conversation override、rotate 新会话）。
+- `/ws list|add|use|remove|status`：收藏工作空间持久化到 `~/.dsh/lark-link/workspaces.json`（原子写 0600），`/ws list` 返回可点按钮卡片，`use` 同时更新会话工作区。
+
+### 升级说明
+
+- 版本升至 `0.7.0`，devDependencies 对齐 DSH `0.2.1-rc.2`（与桌面版宿主一致）；`engines.dsh` 声明 `>=0.2.1-0 <0.3.0-0`。
+- 飞书凭据仍在 DSH credentials（`LARK_LINK_APP`），状态目录仍为 `~/.dsh/lark-link`。
+- 若同时安装独立的 `dsh-wechat`，请禁用其一，避免两个 iLink 长轮询同时消费消息。
+- 构建/微信测试需要能加载 rolldown 原生模块的 Node；DSH 桌面版内置 Node 受 macOS 签名策略限制时请改用系统 Node。
+
+### 测试
+
+- 飞书侧 `node:test`：412 项全过；微信侧 `vitest`：55 个文件 / 985 项通过（1 项既有环境差异跳过）。
+- 覆盖运行卡片状态机/折叠/截断、CardKit 整卡更新 sequence、停止按钮签名、防抖队列、统一帮助目录、`/cd` `/ws`、WeChat 审批/合并/过程展示/客户端面板接线等。
+
 ## 0.6.0
 
 ### Feature: 设置页与插件详情页复用统一控制台 & 移除侧边栏图标

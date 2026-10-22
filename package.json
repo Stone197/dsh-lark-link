@@ -119,7 +119,6 @@
     "icon.svg",
     "cordis.patch.yml",
     "README.md",
-    "README.zh.md",
     "docs",
     "LICENSE",
     "CHANGELOG.md"
@@ -130,9 +129,10 @@
     "check": "tsc --noEmit",
     "test": "node --experimental-strip-types --test \"test/**/*.test.ts\"",
     "test:wechat": "vitest run --config vitest.wechat.config.mjs",
-    "test:all": "npm run test && npm run test:wechat",
-    "prepack": "npm run build"
+    "test:all": "pnpm run test && pnpm run test:wechat",
+    "prepack": "pnpm run build"
   },
+  "packageManager": "pnpm@11.28.5",
   "engines": {
     "node": ">=24.0.0",
     "dsh": ">=0.2.1-0 <0.3.0-0"

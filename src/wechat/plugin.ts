@@ -100,6 +100,20 @@ export function applyWechatChannel(
 		return async () => {};
 	}
 
+	// A real DSH host is a Cordis context, and `ctx.inject` is how every
+	// capability this channel needs (tools / commands / systemPrompt /
+	// webServer) is late-bound. A context WITHOUT it is a stub/fake host
+	// (unit tests, embedders): constructing the bridge there would still read
+	// (and possibly migrate) the user's real `~/.dsh-wechat` and starting the
+	// login/monitor would long-poll the real account with nothing able to
+	// consume the messages. Be inert instead — no storage access, no network.
+	if (typeof (ctx as { inject?: unknown } | undefined)?.inject !== "function") {
+		console.warn(
+			"[dsh-wechat] ctx.inject unavailable — not a DSH host context; WeChat channel not started",
+		);
+		return async () => {};
+	}
+
 	const baseConfig: WeChatDSHConfig = {
 		...defaultConfig(),
 		...pickDefined(channelConfig),
@@ -121,6 +135,8 @@ export function applyWechatChannel(
 		 * disposer instead of failing to apply.
 		 */
 		effect?: (body: () => unknown) => unknown;
+		/** HTTP surface; the channel's QR page and `/wechat/api/*` live on it. */
+		webServer?: unknown;
 	};
 
 	const bridge = new WeChatDSHBridge(context, config, undefined, configStore);
@@ -559,22 +575,23 @@ export function applyWechatChannel(
 
 	// Start the bridge (token resume or QR login), stop on dispose.
 	//
-	// SAFETY GATE: only a real Cordis host can serve this channel. `ctx.inject`
-	// is how every DSH capability (tools / commands / systemPrompt / webServer)
-	// is late-bound, so a context without it is a stub/fake host — e.g. a unit
-	// test driving `apply()` with a hand-written ctx. Starting the iLink monitor
-	// there would resume the user's REAL login from the default storage dir
-	// (`~/.dsh-wechat`), long-poll their WeChat account and advance its
-	// `sync-buf.json` cursor while nothing can consume the messages: an
-	// invisible message loss. Register nothing network-facing for such a host.
-	const canServeChannel = typeof context.inject === "function";
+	// SAFETY/LIFECYCLE GATE: start only on a real DSH host that also mounted an
+	// HTTP surface. `ctx.inject` proves Cordis wiring and `ctx.webServer` proves
+	// the settings page + QR routes can exist; a stub context (unit tests,
+	// embedders) must stay inert, because starting the iLink monitor there
+	// resumes the user's REAL login from the default storage dir
+	// (`~/.dsh-wechat`), long-polls their WeChat account and advances
+	// `sync-buf.json` while nothing can consume the messages.
+	const canServeChannel =
+		typeof context.inject === "function" && context.webServer !== undefined;
 	if (canServeChannel) {
 		void bridge.start().catch((err) => {
 			console.error(`[dsh-wechat] bridge start failed: ${String(err)}`);
 		});
 	} else {
 		console.warn(
-			"[dsh-wechat] ctx.inject unavailable — not a DSH host context; WeChat login/monitor not started",
+			"[dsh-wechat] no DSH webServer on ctx — WeChat login/monitor not started " +
+				"(settings page and /wechat/api/* would be unreachable)",
 		);
 	}
 
