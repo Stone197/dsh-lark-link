@@ -37,6 +37,10 @@
 - `/cd <路径>`：与 `/workspace` 完全等价（`~`、相对路径、per-conversation override、rotate 新会话）。
 - `/ws list|add|use|remove|status`：收藏工作空间持久化到 `~/.dsh/lark-link/workspaces.json`（原子写 0600），`/ws list` 返回可点按钮卡片，`use` 同时更新会话工作区。
 
+### Fix
+
+- `cordis.patch.yml` 以字符串插值环境变量，`DSH_WECHAT_ENABLED=0` 会以 `"0"` 传入并被当成真值。新增 `flagOff()` 统一识别 `false/0/no/off`，插件级与微信级开关都能被环境变量正确关闭（临时实例验证：关闭后 `/wechat/api/status` 404，飞书引擎与客户端 bundle 正常）。
+
 ### 升级说明
 
 - 版本升至 `0.7.0`，devDependencies 对齐 DSH `0.2.1-rc.2`（与桌面版宿主一致）；`engines.dsh` 声明 `>=0.2.1-0 <0.3.0-0`。
