@@ -150,9 +150,21 @@ export function stateDir(): string {
 	);
 }
 
+/**
+ * Interpret a config/env on-off toggle. Only an explicit off value disables —
+ * `cordis.patch.yml` interpolates env vars as STRINGS, so `DSH_*_ENABLED=0`
+ * arrives as "0" (truthy) unless normalized here. Undefined = on.
+ */
+function flagOff(value: unknown): boolean {
+	if (value === undefined || value === null) return false;
+	if (value === false) return true;
+	const s = String(value).trim().toLowerCase();
+	return s === "0" || s === "false" || s === "no" || s === "off";
+}
+
 export function apply(ctx: Context, rawConfig: unknown): void {
 	const cfg = rawConfig as LarkLinkConfig | undefined;
-	if (cfg?.enabled === false) return;
+	if (flagOff(cfg?.enabled)) return;
 
 	const dir = stateDir();
 	mkdirSync(dir, { recursive: true });
@@ -3015,7 +3027,7 @@ export function apply(ctx: Context, rawConfig: unknown): void {
 	// free of WeChat timers/long-poll handles.
 	const hostHasHttpSurface =
 		(ctx as unknown as { webServer?: unknown }).webServer !== undefined;
-	if (wechatCfg?.enabled !== false && hostHasHttpSurface) {
+	if (!flagOff(wechatCfg?.enabled) && hostHasHttpSurface) {
 		let disposeWechat: (() => void | Promise<void>) | undefined;
 		try {
 			disposeWechat = applyWechatChannel(ctx, wechatCfg ?? {});

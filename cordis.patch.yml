@@ -23,7 +23,8 @@
         #   maxAttempts: 2
         #
         # ── WeChat channel (ported from dsh-wechat) ──────────────────────────
-        # Disable with `wechat.enabled: false` or DSH_WECHAT_ENABLED=0.
+        # Disable with `wechat.enabled: false`, DSH_WECHAT_ENABLED=0/false,
+        # or by removing this block (omitted = enabled with defaults).
         # Storage defaults to ~/.dsh-wechat so an existing dsh-wechat login
         # keeps working (no re-scan). The settings page can override the rest.
         wechat:
