@@ -59,11 +59,18 @@ export function detectDefaultWorkspaceRoot(): string | undefined {
 		const live = (path: string | undefined): path is string =>
 			typeof path === "string" && existsSync(path);
 		// 1. most recently updated workspace
+		// Missing/invalid `updatedAt` must NOT win via NaN comparisons: treat an
+		// unparsable timestamp as epoch 0 so a real recent workspace wins
+		// (BUG audit B#P2-5).
+		const updatedAtMs = (value: unknown): number => {
+			if (typeof value === "number" && Number.isFinite(value)) return value;
+			const parsed = typeof value === "string" ? Date.parse(value) : Number.NaN;
+			return Number.isFinite(parsed) ? parsed : 0;
+		};
 		const recent = entries
 			.filter(([, entry]) => live(entry.path))
 			.sort(
-				(a, b) =>
-					Date.parse(b[1].updatedAt ?? "") - Date.parse(a[1].updatedAt ?? ""),
+				(a, b) => updatedAtMs(b[1].updatedAt) - updatedAtMs(a[1].updatedAt),
 			)[0];
 		if (recent && live(recent[1].path)) return recent[1].path;
 		// 2. GUI default workspace

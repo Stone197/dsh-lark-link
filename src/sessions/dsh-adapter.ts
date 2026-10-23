@@ -1164,14 +1164,20 @@ export function createDshAdapter(deps: DshAdapterDeps): DshSessionBackend {
 				const frame = payload?.frame;
 				if (frame?.type !== "chunk") return;
 				const chunk = frame.chunk;
-				if (
-					chunk?.type !== "reasoning-delta" ||
-					typeof chunk.text !== "string" ||
-					chunk.text === ""
-				) {
-					return;
-				}
-				const out = { type: "reasoning/delta", text: chunk.text };
+				if (typeof chunk?.text !== "string" || chunk.text === "") return;
+				// DSH 0.2.1 removed the `assistant/chunk` session event: live text
+				// deltas now arrive ONLY here (the durable text is still committed
+				// via assistant/message). Without forwarding them the streaming
+				// preview / run-card text never updates (BUG audit B#P1-3).
+				// SessionEventOut has no assistant-stream variant for text, so we
+				// emit the legacy shape consumed by event-forwarder.
+				const out =
+					chunk.type === "text-delta"
+						? { type: "assistant/chunk", text: chunk.text }
+						: chunk.type === "reasoning-delta"
+							? { type: "reasoning/delta", text: chunk.text }
+							: undefined;
+				if (!out) return;
 				const set = listeners.get(key);
 				if (set) {
 					for (const fn of set) fn(out as unknown as SessionEventOut);

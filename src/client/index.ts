@@ -877,10 +877,10 @@ export const LarkSettingsConsole = (props?: unknown): unknown => {
 								fontSize: "12.5px",
 							},
 						},
-						h("option", { value: "ptc" }, "PTC 专家模式 (ptc - 默认高精度)"),
+						h("option", { value: "ptc" }, "PTC 模式 (ptc - 默认)"),
 						h("option", { value: "standard" }, "标准模式 (standard)"),
-						h("option", { value: "minimal" }, "极简对话模式 (minimal)"),
-						h("option", { value: "creator" }, "创作者模式 (creator)"),
+						h("option", { value: "minimal" }, "极简模式 (minimal)"),
+						h("option", { value: "cordis" }, "创造/插件模式 (cordis)"),
 					),
 					h("span", { style: { fontSize: "11px", color: "#94A3B8" } }, "新建飞书会话默认加载的 DSH Agent 预设"),
 				),
@@ -905,9 +905,9 @@ export const LarkSettingsConsole = (props?: unknown): unknown => {
 								fontSize: "12.5px",
 							},
 						},
-						h("option", { value: "full" }, "Full Access (开箱全放行 - 推荐)"),
-						h("option", { value: "workspace-only" }, "仅限工作区读写 (workspace-only)"),
-						h("option", { value: "confirm-tools" }, "危险工具逐项卡片确认 (confirm-tools)"),
+						h("option", { value: "danger-full-access" }, "Full access (danger-full-access - 默认)"),
+						h("option", { value: "workspace-write" }, "工作区写 (workspace-write)"),
+						h("option", { value: "read-only" }, "只读 (read-only)"),
 					),
 					h("span", { style: { fontSize: "11px", color: "#94A3B8" } }, "限制会话内工具执行权限与审批交互"),
 				),
@@ -1001,53 +1001,69 @@ export const LarkSettingsConsole = (props?: unknown): unknown => {
 };
 
 export function apply(ctx: ClientContext): void {
+	type EffectCapable = { effect?: (body: () => () => void) => void };
+	/**
+	 * Park a slot registration on the plugin fiber. `slots.inject` returns the
+	 * disposer at runtime but the client type declares void; without parking it,
+	 * a hot reload / plugin unload leaves stale sections and the next register
+	 * can collide on the same id (BUG audit B#P2-3).
+	 */
+	const park = (register: () => void): void => {
+		const effect = (ctx as unknown as EffectCapable).effect;
+		if (typeof effect === "function")
+			effect(register as unknown as () => () => void);
+		else register();
+	};
+
 	// 1. Settings section: inject under DSH Settings -> Lark / 飞书
-	ctx.slots.inject("settings.section", () => {
-		const dispose = ctx.slots.register(
-			{
-				name: "settings.section",
-				id: "lark-link",
-				order: 25,
-				label: () => "Lark / 飞书",
-			},
-			LarkSettingsConsole,
-		);
-		return dispose;
+	park(() => {
+		ctx.slots.inject("settings.section", () => {
+			const dispose = ctx.slots.register(
+				{
+					name: "settings.section",
+					id: "lark-link",
+					order: 25,
+					label: () => "Lark / 飞书",
+				},
+				LarkSettingsConsole,
+			);
+			return dispose;
+		});
 	});
 
 	// 2. Plugins detail page: sidebar -> 插件 -> dsh-lark-link detail panel
 	// Reuses the identical LarkSettingsConsole for 100% parity
-	ctx.slots.inject("plugins.bundle.config", () => {
-		const dispose = ctx.slots.register(
-			{ name: "plugins.bundle.config", key: "dsh-lark-link" },
-			(ownerProps?: unknown) => {
-				const view = (ownerProps as { view?: string } | undefined)?.view;
-				if (view === "summary") return null;
-				return h(LarkSettingsConsole, { isModal: false });
-			},
-		);
-		return dispose;
+	park(() => {
+		ctx.slots.inject("plugins.bundle.config", () => {
+			const dispose = ctx.slots.register(
+				{ name: "plugins.bundle.config", key: "dsh-lark-link" },
+				(ownerProps?: unknown) => {
+					const view = (ownerProps as { view?: string } | undefined)?.view;
+					if (view === "summary") return null;
+					return h(LarkSettingsConsole, { isModal: false });
+				},
+			);
+			return dispose;
+		});
 	});
 
 	// 3. Plugins row config: row clickthrough
-	ctx.slots.inject("plugins.row.config", () => {
-		const dispose = ctx.slots.register(
-			{ name: "plugins.row.config", key: "dsh-lark-link#lark-link" },
-			(ownerProps?: unknown) => {
-				const view = (ownerProps as { view?: string } | undefined)?.view;
-				if (view === "summary") return null;
-				return h(LarkSettingsConsole, { isModal: false });
-			},
-		);
-		return dispose;
+	park(() => {
+		ctx.slots.inject("plugins.row.config", () => {
+			const dispose = ctx.slots.register(
+				{ name: "plugins.row.config", key: "dsh-lark-link#lark-link" },
+				(ownerProps?: unknown) => {
+					const view = (ownerProps as { view?: string } | undefined)?.view;
+					if (view === "summary") return null;
+					return h(LarkSettingsConsole, { isModal: false });
+				},
+			);
+			return dispose;
+		});
 	});
 
 	// 4. Settings section: WeChat panel (order 40), ported from dsh-wechat.
-	// Park the registration on the plugin's fiber: dropping the disposer leaves
-	// the panel registered after unload, and re-registering on the next load
-	// would stack a duplicate entry. `ctx.effect` is the documented owner; the
-	// plain call stays as a fallback for an older client kernel.
-	const register = () =>
+	park(() => {
 		ctx.slots.inject("settings.section", () => {
 			const dispose = ctx.slots.register(
 				{
@@ -1060,12 +1076,5 @@ export function apply(ctx: ClientContext): void {
 			);
 			return dispose;
 		});
-	if (ctx.effect) {
-		// @ts-expect-error — this client-side `slots.inject` is typed void while
-		// the kernel's effect body may return a disposer; the runtime shapes
-		// match (both hand back the slot disposer).
-		ctx.effect(register);
-	} else {
-		register();
-	}
+	});
 }

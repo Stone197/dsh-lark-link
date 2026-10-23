@@ -1313,16 +1313,18 @@ test("adapter run-view: agent/assistant-stream reasoning-delta is forwarded as r
 	assert.equal(ev.text, "hmm");
 });
 
-test("adapter run-view: non-reasoning assistant-stream frames are ignored", async () => {
+test("adapter run-view: text-delta is forwarded as assistant/chunk (0.2.1 stream path)", async () => {
 	const registry = fakeRegistry();
 	const backend = mkBackend(ctxOf(registry, undefined));
 	const handle = await backend.ensureAgent("dm:ou_stream2");
-	const events: Array<{ type: string }> = [];
+	const events: Array<{ type: string; text?: string }> = [];
 	handle.onEvent((e) => events.push(e as never));
 	const agent = registry.agents.get(handle.sessionId) as {
 		emitAssistantStream(frame: unknown): void;
 	};
 	agent.emitAssistantStream({ type: "start", attemptId: "a1", revision: 1, turn: 1, step: 1 });
+	// DSH 0.2.1 removed the assistant/chunk session event: text deltas arrive
+	// only here, so they MUST be re-emitted for the streaming preview/run card.
 	agent.emitAssistantStream({
 		type: "chunk",
 		chunk: { type: "text-delta", index: 0, text: "visible text" },
@@ -1331,7 +1333,16 @@ test("adapter run-view: non-reasoning assistant-stream frames are ignored", asyn
 		type: "chunk",
 		chunk: { type: "reasoning-delta", index: 1, text: "" },
 	});
-	assert.equal(events.length, 0, "only non-empty reasoning deltas are forwarded");
+	agent.emitAssistantStream({
+		type: "chunk",
+		chunk: { type: "block-end", index: 2, block: { type: "text", text: "x" } },
+	});
+	assert.deepEqual(
+		events.map((e) => e.type),
+		["assistant/chunk"],
+		"only non-empty text deltas are forwarded; empty reasoning and block-end are dropped",
+	);
+	assert.equal(events[0]?.text, "visible text");
 });
 
 test("adapter run-view: dispose unsubscribes the assistant-stream listener too", async () => {

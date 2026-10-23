@@ -64,6 +64,11 @@ export interface CommandRouterDeps {
 	 * relative paths against the bridge default and labels it 默认工作区.
 	 */
 	workspaceRootFor?: (conversationKey: string) => string | undefined;
+	/**
+	 * Effective default workspace (the host wires the GUI's current workspace).
+	 * Optional: falls back to config.workspaceRoot / process.cwd().
+	 */
+	defaultWorkspace?: () => string;
 	/** Clock injection (saved-workspace timestamps in tests). */
 	now?: () => number;
 }
@@ -154,6 +159,11 @@ export interface WorkspaceCommandDeps {
 	workspacesFile?: string;
 	/** Per-conversation workspace override reader (wired by the host). */
 	workspaceRootFor?: (conversationKey: string) => string | undefined;
+	/**
+	 * Effective default workspace (the host wires the GUI's current workspace).
+	 * Optional: falls back to config.workspaceRoot / process.cwd().
+	 */
+	defaultWorkspace?: () => string;
 	/** Clock injection (saved-workspace timestamps in tests). */
 	now?: () => number;
 }
@@ -182,7 +192,7 @@ const savedWorkspaces =
 const keyOf = (msg: FeishuInboundMessage): string =>
 	deps.ctx.conversationKeyFor(msg);
 const defaultWorkspace = (): string =>
-	deps.ctx.cfg().workspaceRoot || process.cwd();
+	deps.defaultWorkspace?.() ?? (deps.ctx.cfg().workspaceRoot || process.cwd());
 /** This conversation's workspace: per-key override (when wired) ?? default. */
 const currentWorkspace = (msg: FeishuInboundMessage): string =>
 	deps.workspaceRootFor?.(keyOf(msg)) ?? defaultWorkspace();

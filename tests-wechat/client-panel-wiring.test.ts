@@ -349,7 +349,10 @@ describe.skipIf(!hasWechatPanel)("settings panel grouping", () => {
 	it("registers the WeChat section through a parked ctx.effect", () => {
 		// The unified client registers BOTH sections from one bundle; the WeChat
 		// one keeps id "wechat" (the channel's HTTP routes are /wechat/api/*).
-		expect(client).toContain("ctx.effect(register)");
+		// All four slot registrations go through the shared `park()` helper,
+		// which parks the slot disposer on ctx.effect when the kernel has it.
+		expect(client).toContain("const park");
+		expect(client).toContain("effect(register as unknown as () => () => void)");
 		expect(client).toContain('ctx.slots.inject("settings.section"');
 		expect(client).toContain('id: "wechat"');
 		expect(client).toContain('label: "WeChat"');

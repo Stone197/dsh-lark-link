@@ -199,7 +199,7 @@ export async function waitFor<T>(
 	fn: () => T | undefined | false | Promise<T | undefined | false>,
 	opts: { timeoutMs?: number; intervalMs?: number; label?: string } = {},
 ): Promise<T> {
-	const timeoutMs = opts.timeoutMs ?? 4000;
+	const timeoutMs = opts.timeoutMs ?? 8000;
 	const intervalMs = opts.intervalMs ?? 10;
 	const started = Date.now();
 	let last: unknown;

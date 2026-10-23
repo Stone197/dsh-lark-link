@@ -50,6 +50,17 @@
 
 - `cordis.patch.yml` 以字符串插值环境变量，`DSH_WECHAT_ENABLED=0` 会以 `"0"` 传入并被当成真值。新增 `flagOff()` 统一识别 `false/0/no/off`，插件级与微信级开关都能被环境变量正确关闭（临时实例验证：关闭后 `/wechat/api/status` 404，飞书引擎与客户端 bundle 正常）。
 
+### Fix（第二轮 bug 审计：DSH 0.2.1 兼容性）
+
+- **DSH 原生命令全部失败（P1）**：`commands.execute` 在 0.2.1 是四参 `(agent, line, submittedAttachments, signal)`，旧三参把 signal 放错位导致宿主读 `undefined.aborted` 抛错——飞书 `/compact` `/export` `/feedback` 等现在恢复正常。
+- **`/resume` 空卡片（P1）**：会话枚举改用 0.2.1 `sessionQuery.listSessions()`（`{header}` 形状），文件兜底支持代数文件名 `session.vN.jsonl.zstd`，标题解析走 `readTitle/readSession/listEvents`；`/doctor` 的 session log 导出改用官方 `open(id,"read")` + 逐帧 zstd 解压（原来只导出第一帧）。GH#9 replay salvage 的 session 读取也改为 sessionQuery 优先。
+- **实时文本流失效（P1）**：0.2.1 删除了 `assistant/chunk` 事件，文本增量只在 `agent/assistant-stream`；适配器现在把 `text-delta` 转发为 `assistant/chunk`，流式预览卡与运行卡文本恢复实时刷新。
+- **默认工作区不再被冻结**：探测到的 GUI 工作区不再写入 `runtime-overrides.json`，改为最多 10s 重新探测一次（跟随 GUI 切换工作区）；显式 `workspaceRoot` 配置仍然优先。微信通道默认 cwd 也跟随该工作区。
+- **客户端 slot 泄漏**：四个设置/插件 slot 注册统一经 `park()` 挂到插件 fiber，热重载不再残留 section 或重复 id 报错。
+- **设置面板无效选项**：预设改为 standard/ptc/minimal/cordis，权限改为 read-only/workspace-write/danger-full-access（0.2.1 有效值）。
+- **探测排序**：`updatedAt` 缺失/非法时不再因 NaN 比较压过真实最新工作区。
+- **测试**：新增假 Cordis ctx + 真 `apply()` 集成测试 18 例、0.2.1 会话枚举/导出 11 例、run-card 并发与重复点击回归；`node:test` 459 项、`vitest` 985 项全过。
+
 ### 升级说明
 
 - 版本升至 `0.7.0`，devDependencies 对齐 DSH `0.2.1-rc.2`（与桌面版宿主一致）；`engines.dsh` 声明 `>=0.2.1-0 <0.3.0-0`。

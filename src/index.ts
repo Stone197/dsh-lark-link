@@ -15,7 +15,15 @@ import { createDshAdapter } from "./sessions/dsh-adapter.ts";
 import { createMemoryDshBackend } from "./sessions/dsh-session-backend.ts";
 import { createConversationManager } from "./sessions/conversation-manager.ts";
 import { createConversationConfigStore } from "./sessions/conversation-config.ts";
-import { listWorkspaceSessions, extractTitleFromEvents } from "./sessions/workspace-sessions.ts";
+import {
+	listWorkspaceSessions,
+	extractTitleFromEvents,
+	decodeSessionDirName,
+	encodeSessionDirName,
+	findSessionLogFile,
+	readSessionLogJsonl,
+	type SessionQuerySource,
+} from "./sessions/workspace-sessions.ts";
 import { createTurnSupervisor } from "./sessions/turn-supervisor.ts";
 import { createOutbox, type OutboxSender } from "./outbound/outbox.ts";
 import { createEventForwarder } from "./outbound/event-forwarder.ts";
@@ -110,7 +118,6 @@ import {
 	rmSync,
 	existsSync,
 } from "node:fs";
-import { zstdDecompressSync } from "node:zlib";
 import { randomBytes } from "node:crypto";
 import type { FeishuInboundMessage } from "./common/types.ts";
 import { createStopCallbackAuth } from "./outbound/run-callback.ts";
@@ -165,6 +172,85 @@ function flagOff(value: unknown): boolean {
 	return s === "0" || s === "false" || s === "no" || s === "off";
 }
 
+/**
+ * Structural slice of the DSH 0.2.1 sessionPersistence read API used by
+ * doctor's session-log export. 0.2.1 keeps `open`/`stat`/`list`/`create`/
+ * `flush`; `load`/`inspect`/`readRaw`/`readFrom` were removed, and the webui
+ * itself exports a log via `open(id, "read")` + `handle.read(0)`.
+ */
+interface PersistenceHeaderLike {
+	version?: number;
+	id?: string;
+	createdAt?: number;
+	cwd?: string;
+	parentSession?: string;
+	isSeeded?: boolean;
+	origin?: string;
+	delegationDepth?: number;
+	agentPreset?: string;
+}
+
+interface PersistenceReadHandle {
+	header?: PersistenceHeaderLike;
+	read(
+		from: number,
+		to: number | undefined,
+		options?: { signal?: AbortSignal },
+	): Promise<{ events?: readonly unknown[] }>;
+	close?(): Promise<void>;
+}
+
+interface PersistenceReadSource {
+	/** 0.1.x only: returns the canonical JSONL + filename directly. */
+	readRaw?(
+		id: string,
+	): Promise<{ filename: string; content: string; meta?: unknown } | undefined>;
+	/** 0.2.1+: read handle over the committed log. */
+	open?(
+		id: string,
+		access: "read",
+		options?: { signal?: AbortSignal },
+	): Promise<PersistenceReadHandle>;
+}
+
+/**
+ * Serialize one session's logical log as canonical JSONL text — the header
+ * line, then one line per event, with a trailing newline. Verbatim port of
+ * `@deepseek-ai/dsh-session-log-export`'s `serializeSessionLog` so doctor's
+ * ZIP entry is byte-compatible with the WebUI "Session log" download.
+ */
+function serializeSessionLogText(
+	header: PersistenceHeaderLike | undefined,
+	events: readonly unknown[],
+): string {
+	const lines: string[] = [];
+	if (header !== undefined && typeof header.id === "string") {
+		lines.push(
+			JSON.stringify({
+				type: "session",
+				version: header.version,
+				id: header.id,
+				createdAt: header.createdAt,
+				...(header.cwd === undefined ? {} : { cwd: header.cwd }),
+				...(header.parentSession === undefined
+					? {}
+					: { parentSession: header.parentSession }),
+				isSeeded: header.isSeeded,
+				...(header.origin === undefined ? {} : { origin: header.origin }),
+				delegationDepth: header.delegationDepth ?? 0,
+				...(header.agentPreset === undefined
+					? {}
+					: { agentPreset: header.agentPreset }),
+			}),
+		);
+	}
+	for (const event of events) {
+		const line = JSON.stringify(event);
+		if (line !== undefined) lines.push(line);
+	}
+	return `${lines.join("\n")}\n`;
+}
+
 export function apply(ctx: Context, rawConfig: unknown): void {
 	const cfg = rawConfig as LarkLinkConfig | undefined;
 	if (flagOff(cfg?.enabled)) return;
@@ -174,23 +260,37 @@ export function apply(ctx: Context, rawConfig: unknown): void {
 	const logger: Logger = createLogger("lark-link");
 
 	// ---- config / status / stores -------------------------------------------
-	// Default workspace = the one the GUI is currently using. A desktop DSH
-	// process runs with cwd = the PROFILE directory, which is not a GUI
-	// workspace; sessions created there never show up in the conversation list.
+	// Explicit workspace override only (env/patch config). The GUI's own
+	// workspace is detected LIVE by effectiveWorkspaceRoot() below and is never
+	// persisted: writing it into runtime-overrides.json froze it forever after
+	// the first config save (BUG audit B#P2-1).
+	// A desktop DSH process runs with cwd = the PROFILE directory, which is not
+	// a GUI workspace, so process.cwd() is only the last-resort fallback.
 	const defaultWorkspaceRoot =
-		cfg && "workspaceRoot" in cfg && typeof cfg.workspaceRoot === "string"
-			? cfg.workspaceRoot
-			: detectDefaultWorkspaceRoot();
+		(cfg && typeof cfg.workspaceRoot === "string" && cfg.workspaceRoot) ||
+		detectDefaultWorkspaceRoot();
 	const configStore = createConfigStore(dir, {
 		groupPolicy: cfg?.groupPolicy,
 		denyList: cfg?.denyList,
 		replay: cfg?.replay,
-		...(defaultWorkspaceRoot ? { workspaceRoot: defaultWorkspaceRoot } : {}),
+		...(cfg?.workspaceRoot ? { workspaceRoot: cfg.workspaceRoot } : {}),
 	});
 	const status = createStatusStore(join(dir, "status.json"));
 	const routeStore = createRouteStore(join(dir, "routes.json"));
 	const dedupe = createDedupeStore(join(dir, "dedupe.jsonl"));
 	const getCfg = (): ReturnType<typeof configStore.get> => configStore.get();
+	// Effective workspace root: explicit config override wins; otherwise follow
+	// the GUI's most recently used workspace (re-detected at most every 10s so a
+	// GUI workspace switch is picked up without a plugin reload).
+	let detectedWs: { at: number; path?: string } | undefined;
+	const effectiveWorkspaceRoot = (): string => {
+		const configured = getCfg().workspaceRoot;
+		if (configured) return configured;
+		if (!detectedWs || Date.now() - detectedWs.at > 10_000) {
+			detectedWs = { at: Date.now(), path: detectDefaultWorkspaceRoot() };
+		}
+		return detectedWs.path ?? process.cwd();
+	};
 	// Durable inbound-request journal (入站请求补发). Records agent-bound text
 	// requests before enqueue; on boot, accepted-but-undelivered requests are
 	// re-dispatched so a crash/plugin-reload/dsh-restart mid-turn doesn't drop
@@ -299,7 +399,7 @@ export function apply(ctx: Context, rawConfig: unknown): void {
 			// Per-key resolution: conversation override ?? bridge default.
 			cwd: (key: string) =>
 				convCfg.get(key).workspaceRoot ??
-				(getCfg().workspaceRoot || process.cwd()),
+				(effectiveWorkspaceRoot()),
 			preset: (key: string) => {
 				// Conversation override ?? bridge default. Historical alias
 				// `code` maps onto DSH's real id `ptc` (GH #11 — reverse of
@@ -425,8 +525,14 @@ export function apply(ctx: Context, rawConfig: unknown): void {
 									appId: creds?.appId || "",
 									groupPolicy: cfg.groupPolicy || "mention",
 									agentPreset: cfg.agentPreset || "ptc",
-									permissionMode: cfg.permissionMode || "full",
-									workspaceRoot: cfg.workspaceRoot || "",
+									permissionMode: cfg.permissionMode || "danger-full-access",
+									workspaceRoot: effectiveWorkspaceRoot(),
+									// Opt-in interaction switches, visible for diagnostics.
+									streaming: {
+										enabled: cfg.streaming.enabled,
+										runCard: cfg.streaming.runCard,
+									},
+									inboundMerge: cfg.inboundMerge,
 									replay: cfg.replay ?? {
 										auto: true,
 										retentionMinutes: 30,
@@ -976,10 +1082,15 @@ export function apply(ctx: Context, rawConfig: unknown): void {
 			try {
 				const services = ctx as unknown as {
 					commands?: {
+						// DSH 0.2.1: (agent, line, submittedAttachments, signal).
+						// The old 0.1.x 3-arg form put the signal in slot 3, so the
+						// host read `undefined.aborted` and EVERY native command
+						// (/compact, /export, /feedback …) threw (BUG audit B#P1-1).
 						execute?(
 							agent: unknown,
 							line: string,
-							signal?: AbortSignal,
+							submittedAttachments: readonly unknown[],
+							signal: AbortSignal,
 						): Promise<
 							| {
 									result?: { kind: string; text?: string };
@@ -1001,6 +1112,7 @@ export function apply(ctx: Context, rawConfig: unknown): void {
 				const out = await commands.execute(
 					agent,
 					line,
+					[],
 					new AbortController().signal,
 				);
 				if (!out?.result) return { kind: "error", text: `未知命令 /${name}` };
@@ -1208,7 +1320,7 @@ export function apply(ctx: Context, rawConfig: unknown): void {
 				// Per-conversation workspace: this chat's override ?? bridge default.
 				const curWs =
 					convCfg.get(wsKey).workspaceRoot ??
-					(getCfg().workspaceRoot || process.cwd());
+					(effectiveWorkspaceRoot());
 				if (!arg) {
 					await durableReply(name, 
 						msg,
@@ -1265,10 +1377,17 @@ export function apply(ctx: Context, rawConfig: unknown): void {
 				const key = bridge.conversationKeyFor(msg);
 				const wsRoot =
 					convCfg.get(key).workspaceRoot ??
-					(getCfg().workspaceRoot || process.cwd());
+					(effectiveWorkspaceRoot());
 				const currentSessionId =
 					bridge.backend?.get(key)?.sessionId ??
 					convCfg.get(key).activeSessionId;
+				// DSH 0.2.1: sessionQuery is the real enumeration source — its
+				// rows are `{ header }` records (not flat headers) and titles are
+				// folded through readTitle/readSession. sessionPersistence stays
+				// as the legacy fallback (BUG audit B#P1-2).
+				const query = (ctx as unknown as { get?(name: string): unknown }).get?.(
+					"sessionQuery",
+				) as SessionQuerySource | undefined;
 				const persistence = (
 					ctx as unknown as { get?(name: string): unknown }
 				).get?.("sessionPersistence") as
@@ -1327,6 +1446,7 @@ export function apply(ctx: Context, rawConfig: unknown): void {
 							"sessions",
 						),
 						cwd: wsRoot,
+						query,
 						persistence: persistence?.list
 							? {
 									list: async () => await persistence.list!(),
@@ -1534,7 +1654,7 @@ export function apply(ctx: Context, rawConfig: unknown): void {
 				await conversations?.rotate(key);
 				const newWs =
 					convCfg.get(key).workspaceRoot ??
-					(getCfg().workspaceRoot || process.cwd());
+					(effectiveWorkspaceRoot());
 				await durableReply(name, 
 					msg,
 					`已开启新会话（工作区: ${newWs}）。下一条消息开始全新上下文。`,
@@ -1841,8 +1961,9 @@ export function apply(ctx: Context, rawConfig: unknown): void {
 		commands: dshCommands,
 		bridgeHandler,
 		// /cd, /ws status and /ws list show the conversation's own workspace
-		// override (falls back to the bridge default when unset).
+		// override (falls back to the effective default when unset).
 		workspaceRootFor: (key: string) => convCfg.get(key).workspaceRoot,
+		defaultWorkspace: effectiveWorkspaceRoot,
 	});
 
 	// Card action routing (schema 2.0 behaviors:[{type:"callback",value}]):
@@ -2036,7 +2157,7 @@ export function apply(ctx: Context, rawConfig: unknown): void {
 				const tpl = op.slice("goal:tpl:".length);
 				const knownRoute = routeStore.all().find((r) => r.chatId === chatId);
 				const sessionKey = knownRoute?.sessionKey ?? (chatId ? `dm:${chatId}` : "");
-				const wsRoot = convCfg.get(sessionKey).workspaceRoot ?? (getCfg().workspaceRoot || process.cwd());
+				const wsRoot = convCfg.get(sessionKey).workspaceRoot ?? (effectiveWorkspaceRoot());
 				let obj = "构建工程并运行全量测试验证";
 				if (tpl === "fix") obj = "诊断并修复当前工程中的已知问题与测试失败";
 				else if (tpl === "refactor") obj = "重构核心模块并补齐单元测试与文档";
@@ -2106,8 +2227,29 @@ export function apply(ctx: Context, rawConfig: unknown): void {
 				load?(id: string): Promise<{ events?: readonly unknown[] } | undefined>;
 		  }
 		| undefined;
+	const sessionQueryService = (
+		ctx as unknown as {
+			get?(name: string): unknown;
+		}
+	).get?.("sessionQuery") as
+		| {
+				readSession?(
+					id: string,
+				): Promise<{ events?: readonly unknown[] } | undefined>;
+		  }
+		| undefined;
 	const replaySalvage = createReplaySalvage({
-		loadSession: async (id) => sessionPersistenceService?.load?.(id),
+		// DSH 0.2.1 removed sessionPersistence.load; prefer sessionQuery, keep the
+		// legacy loader as the fallback for older hosts (BUG audit B#P2-4).
+		loadSession: async (id) => {
+			try {
+				const snap = await sessionQueryService?.readSession?.(id);
+				if (snap?.events) return { events: snap.events };
+			} catch {
+				// fall through to the legacy loader
+			}
+			return sessionPersistenceService?.load?.(id);
+		},
 		enqueue: (input) => outbox.enqueue(input),
 		wal: inboundWal,
 		logger,
@@ -2495,7 +2637,7 @@ export function apply(ctx: Context, rawConfig: unknown): void {
 					bridge.backend?.keyForSessionId?.(sessionId) ?? sessionId;
 				const workspaceRoot =
 					convCfg.get(convKeyForWs).workspaceRoot ??
-					(getCfg().workspaceRoot || process.cwd());
+					(effectiveWorkspaceRoot());
 				// GH #7: drive-letter paths are absolute too, and containment
 				// must use relative() — startsWith("/") joined a Windows
 				// absolute path under the root and then always rejected it.
@@ -2747,11 +2889,12 @@ export function apply(ctx: Context, rawConfig: unknown): void {
 	}
 
 	/**
-	 * Locate the DSH session log for a bridge session id. Persisted logs live
-	 * at <DSH_HOME>/sessions/<workspace-dir>/<encoded-session-id>/session.jsonl.zstd
-	 * where ":" encodes as "~003A" — scan every workspace dir for the match.
+	 * Scan ~/.dsh/sessions for the most recently written lark-link session id.
+	 * The session directory holds a GENERATION log (`session.v4.jsonl.zstd` on
+	 * 0.2.1, untagged `session.jsonl.zstd` on 0.1.x), so the newest canonical
+	 * file reported by {@link findSessionLogFile} is used — never a hardcoded
+	 * filename (BUG audit B#P1-2).
 	 */
-	/** Scan ~/.dsh/sessions for the most recently written lark-link session id. */
 	const findLatestLarkSessionId = (): string | undefined => {
 		const sessionsRoot = join(
 			process.env.DSH_HOME ?? join(homedir(), ".dsh"),
@@ -2769,17 +2912,16 @@ export function apply(ctx: Context, rawConfig: unknown): void {
 			}
 			for (const name of entries) {
 				if (!name.includes("lark-link")) continue;
-				const sessionDir = join(wsPath, name);
-				const zstd = join(sessionDir, "session.jsonl.zstd");
-				if (!existsSync(zstd)) continue;
+				const log = findSessionLogFile(join(wsPath, name));
+				if (log === undefined) continue;
 				let mtime = 0;
 				try {
-					mtime = statSync(zstd).mtimeMs;
+					mtime = statSync(log).mtimeMs;
 				} catch {
 					continue;
 				}
 				if (!latest || mtime > latest.mtime) {
-					latest = { id: name.replace(/~003A/g, ":"), mtime };
+					latest = { id: decodeSessionDirName(name), mtime };
 				}
 			}
 		}
@@ -2795,15 +2937,9 @@ export function apply(ctx: Context, rawConfig: unknown): void {
 			const services = ctx as unknown as {
 				get?(name: string): unknown;
 			};
-			const persistence = services.get?.("sessionPersistence") as
-				| {
-						readRaw?(
-							id: string,
-						): Promise<
-							{ filename: string; content: string; meta?: unknown } | undefined
-						>;
-				  }
-				| undefined;
+			const persistence = services.get?.(
+				"sessionPersistence",
+			) as PersistenceReadSource | undefined;
 			const query = services.get?.("sessionQuery") as
 				| {
 						traceSession?(id: string): Promise<{
@@ -2819,20 +2955,70 @@ export function apply(ctx: Context, rawConfig: unknown): void {
 				| undefined;
 			const files: Array<{ name: string; data: Uint8Array }> = [];
 
-			// Primary: same shape as the webui "Session log" download via the
-			// sessionPersistence service.
-			let root: { filename: string; content: string } | undefined;
-			if (persistence?.readRaw) {
-				try {
-					root = await persistence.readRaw(sessionId);
-				} catch (err) {
-					logger.warn(
-						`doctor: sessionPersistence.readRaw failed: ${err instanceof Error ? err.message : String(err)}`,
-					);
+			/**
+			 * Read one session's logical log as canonical JSONL. 0.1.x exposes
+			 * `readRaw`; 0.2.1 removed it and instead wants a read handle
+			 * (`open` + `read`) — the exact path the host's own session-log
+			 * export uses (BUG audit B#P1-2/P2-4).
+			 */
+			const readPersistedSessionLog = async (
+				id: string,
+			): Promise<{ filename: string; content: string } | undefined> => {
+				if (!persistence) return undefined;
+				if (persistence.readRaw) {
+					try {
+						const raw = await persistence.readRaw(id);
+						if (raw) return raw;
+					} catch (err) {
+						logger.warn(
+							`doctor: sessionPersistence.readRaw failed for ${id}: ${err instanceof Error ? err.message : String(err)}`,
+						);
+					}
 				}
-			} else {
+				if (persistence.open) {
+					let handle: PersistenceReadHandle | undefined;
+					try {
+						handle = await persistence.open(id, "read");
+					} catch (err) {
+						const name = (err as { name?: unknown } | null)?.name;
+						if (typeof name === "string" && name.includes("NotFound")) {
+							return undefined;
+						}
+						logger.warn(
+							`doctor: sessionPersistence.open failed for ${id}: ${err instanceof Error ? err.message : String(err)}`,
+						);
+						return undefined;
+					}
+					if (!handle) return undefined;
+					try {
+						if (typeof handle.read !== "function") return undefined;
+						const page = await handle.read(0, undefined);
+						return {
+							filename: "session.jsonl",
+							content: serializeSessionLogText(handle.header, page?.events ?? []),
+						};
+					} catch (err) {
+						logger.warn(
+							`doctor: sessionPersistence read failed for ${id}: ${err instanceof Error ? err.message : String(err)}`,
+						);
+						return undefined;
+					} finally {
+						try {
+							await handle.close?.();
+						} catch {
+							// best-effort handle release
+						}
+					}
+				}
+				return undefined;
+			};
+
+			// Primary: the persistence service (0.1.x readRaw / 0.2.1 read
+			// handle) — the same logical log the webui "Session log" download uses.
+			const root = await readPersistedSessionLog(sessionId);
+			if (!root) {
 				logger.warn(
-					"doctor: sessionPersistence service unavailable — falling back to file scan",
+					"doctor: session log unavailable via the persistence service — falling back to file scan",
 				);
 			}
 			if (root) {
@@ -2852,7 +3038,7 @@ export function apply(ctx: Context, rawConfig: unknown): void {
 						const id = node.session.header.id;
 						if (seen.has(id)) continue;
 						seen.add(id);
-						const raw = await persistence?.readRaw?.(id);
+						const raw = await readPersistedSessionLog(id);
 						if (raw !== undefined) {
 							const safe = id.replace(/[^A-Za-z0-9_-]/g, "_");
 							files.push({
@@ -2875,39 +3061,32 @@ export function apply(ctx: Context, rawConfig: unknown): void {
 				}
 			}
 
-			// Fallback: locate the session log on disk directly (node:zlib
-			// decompresses zstd; no system unzstd needed).
+			// Fallback: locate the session log on disk directly. Session
+			// directory names are `encodeSegment(id)` and the artifact is a
+			// GENERATION filename (`session.vN.jsonl[.zstd]`; 0.2.1 writes
+			// `session.v4.jsonl.zstd`) with one Zstandard FRAME per commit, so
+			// pick the newest generation and decode every frame.
 			if (files.length === 0) {
 				const sessionsRoot = join(
 					process.env.DSH_HOME ?? join(homedir(), ".dsh"),
 					"sessions",
 				);
-				const encoded = sessionId.replace(/:/g, "~003A");
-				let zstdPath: string | undefined;
+				const encoded = encodeSessionDirName(sessionId);
+				let logPath: string | undefined;
 				if (existsSync(sessionsRoot)) {
 					for (const wsDir of readdirSync(sessionsRoot)) {
-						const candidate = join(
-							sessionsRoot,
-							wsDir,
-							encoded,
-							"session.jsonl.zstd",
-						);
-						if (existsSync(candidate)) {
-							zstdPath = candidate;
-							break;
-						}
+						logPath = findSessionLogFile(join(sessionsRoot, wsDir, encoded));
+						if (logPath !== undefined) break;
 					}
 				}
-				if (!zstdPath) {
+				if (!logPath) {
 					logger.warn(
 						`doctor: no session log found for ${sessionId} (service + file scan)`,
 					);
 					return undefined;
 				}
-				const jsonl = zstdDecompressSync(readFileSync(zstdPath)).toString(
-					"utf8",
-				);
-				logger.info(`doctor: file-scan fallback used: ${zstdPath}`);
+				const jsonl = await readSessionLogJsonl(logPath);
+				logger.info(`doctor: file-scan fallback used: ${logPath}`);
 				files.push({ name: "session.jsonl", data: Buffer.from(jsonl, "utf8") });
 			}
 
@@ -3117,7 +3296,16 @@ export function apply(ctx: Context, rawConfig: unknown): void {
 	if (!flagOff(wechatCfg?.enabled) && hostHasHttpSurface) {
 		let disposeWechat: (() => void | Promise<void>) | undefined;
 		try {
-			disposeWechat = applyWechatChannel(ctx, wechatCfg ?? {});
+			disposeWechat = applyWechatChannel(ctx, {
+				...(wechatCfg ?? {}),
+				// Default the WeChat channel to the same workspace the GUI is
+				// using. Without this, a desktop host's cwd is the PROFILE
+				// directory and WeChat sessions would pile up there, invisible in
+				// the GUI (BUG audit B#P2-2).
+				...(wechatCfg?.cwd || !defaultWorkspaceRoot
+					? {}
+					: { cwd: defaultWorkspaceRoot }),
+			});
 		} catch (err) {
 			logger.warn(`WeChat channel failed to start: ${String(err)}`);
 		}

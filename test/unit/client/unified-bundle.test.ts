@@ -31,8 +31,12 @@ test("client entry registers BOTH settings sections from one bundle", () => {
 	assert.match(clientEntry, /order: 40/);
 	// The label is the literal the settings panel shows; keep it stable.
 	assert.match(clientEntry, /label: "WeChat"/);
-	// Park the WeChat registration on the plugin fiber (unload-safe).
-	assert.match(clientEntry, /ctx\.effect\(register\)/);
+	// Every slot registration is parked on the plugin fiber (unload-safe).
+	assert.ok(
+		(clientEntry.match(/park\(\(\) => \{/g) ?? []).length >= 4,
+		"all four slot registrations go through park()",
+	);
+	assert.match(clientEntry, /effect\(register as unknown as \(\) => \(\) => void\)/);
 });
 
 test("client entry keeps the plugins detail-page registrations", () => {

@@ -2,10 +2,16 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
+import { zstdCompressSync } from "node:zlib";
 import {
 	projectKeyOf,
 	decodeSessionDirName,
+	encodeSessionDirName,
+	normalizeSessionHeader,
+	parseGenerationLogFilename,
+	findSessionLogFile,
+	readSessionLogJsonl,
 	listWorkspaceSessions,
 	extractTitleFromEvents,
 	createSavedWorkspaceStore,
@@ -249,6 +255,335 @@ test("list: inspect resolves titles from persistence events", async () => {
 	});
 	assert.equal(rows.length, 1);
 	assert.equal(rows[0]!.title, "测试会话标题提取");
+});
+
+
+// ---- DSH 0.2.1 shapes: `{ header }` rows + generation filenames --------------
+
+test("normalizeSessionHeader: accepts 0.2.1 { header } rows and legacy flat headers", () => {
+	// 0.2.1 sessionQuery / sessionPersistence rows.
+	const record = normalizeSessionHeader({
+		header: {
+			version: 4,
+			id: "session-abc",
+			createdAt: 1234,
+			cwd: "/ws/proj",
+			agentPreset: "ptc",
+			origin: "subagent",
+			title: "  Hello  ",
+		},
+		live: true,
+		persisted: true,
+	});
+	assert.deepEqual(record, {
+		id: "session-abc",
+		createdAt: 1234,
+		cwd: "/ws/proj",
+		origin: "subagent",
+		agentPreset: "ptc",
+		title: "Hello",
+	});
+	// 0.1.x flat header.
+	assert.deepEqual(normalizeSessionHeader({ id: "flat", createdAt: 7, cwd: "/a" }), {
+		id: "flat",
+		createdAt: 7,
+		cwd: "/a",
+	});
+	// Unusable rows are dropped instead of becoming `undefined` sessions.
+	assert.equal(normalizeSessionHeader({ createdAt: 1 }), undefined);
+	assert.equal(normalizeSessionHeader({ header: { id: "   " } }), undefined);
+	assert.equal(normalizeSessionHeader(null), undefined);
+	// `updatedAt` is the documented fallback when a host omits createdAt.
+	assert.deepEqual(normalizeSessionHeader({ header: { id: "x", updatedAt: 99 } }), {
+		id: "x",
+		createdAt: 99,
+	});
+});
+
+test("list: 0.2.1 sessionQuery `{ header }` rows filter by cwd, sort desc, cap", async () => {
+	const query = {
+		async listSessions() {
+			return [
+				{
+					header: {
+						version: 4,
+						id: "q-newer",
+						createdAt: 3000,
+						cwd: "/ws/proj",
+						agentPreset: "ptc",
+					},
+					live: false,
+					persisted: true,
+				},
+				{ header: { id: "q-older", createdAt: 1000, cwd: "/ws/proj" }, live: true },
+				{ header: { id: "q-other-ws", createdAt: 5000, cwd: "/elsewhere" } },
+				{ header: { id: "q-sub", createdAt: 4000, cwd: "/ws/proj", origin: "subagent" } },
+				{ header: { id: "q-current", createdAt: 2000, cwd: "/ws/proj" } },
+			];
+		},
+	};
+	const rows = await listWorkspaceSessions({
+		sessionsRoot: "/nonexistent",
+		cwd: "/ws/proj",
+		query,
+		exclude: ["q-current"],
+	});
+	assert.deepEqual(rows.map((r) => r.id), ["q-newer", "q-older"]);
+	assert.equal(rows[0]!.source, "query");
+	assert.equal(rows[0]!.preset, "ptc");
+	assert.equal(rows[0]!.createdAt, 3000);
+
+	const capped = await listWorkspaceSessions({
+		sessionsRoot: "/nonexistent",
+		cwd: "/ws/proj",
+		query,
+		limit: 1,
+	});
+	assert.deepEqual(capped.map((r) => r.id), ["q-newer"]);
+});
+
+test("list: sessionQuery wins over sessionPersistence; empty/throwing query falls back", async () => {
+	const persistence = {
+		async list() {
+			return [{ id: "legacy", createdAt: 1, cwd: "/ws/proj" }];
+		},
+	};
+	const query = {
+		async listSessions() {
+			return [{ header: { id: "from-query", createdAt: 2, cwd: "/ws/proj" } }];
+		},
+	};
+	const preferred = await listWorkspaceSessions({
+		sessionsRoot: "/nonexistent",
+		cwd: "/ws/proj",
+		query,
+		persistence,
+	});
+	assert.deepEqual(preferred.map((r) => r.id), ["from-query"]);
+	assert.equal(preferred[0]!.source, "query");
+
+	const emptyQuery = {
+		async listSessions() {
+			return [];
+		},
+	};
+	const fallback = await listWorkspaceSessions({
+		sessionsRoot: "/nonexistent",
+		cwd: "/ws/proj",
+		query: emptyQuery,
+		persistence,
+	});
+	assert.deepEqual(fallback.map((r) => r.id), ["legacy"]);
+	assert.equal(fallback[0]!.source, "service");
+
+	const failingQuery = {
+		async listSessions(): Promise<never> {
+			throw new Error("query down");
+		},
+	};
+	const failed = await listWorkspaceSessions({
+		sessionsRoot: "/nonexistent",
+		cwd: "/ws/proj",
+		query: failingQuery,
+		persistence,
+	});
+	assert.deepEqual(failed.map((r) => r.id), ["legacy"]);
+});
+
+test("list: 0.2.1 sessionPersistence.list() `{ header }` rows are normalized", async () => {
+	const persistence = {
+		async list() {
+			return [
+				{
+					header: { version: 4, id: "v4-new", createdAt: 200, cwd: "/ws/proj" },
+					formatStatus: "current",
+					revision: "rev",
+					sizeBytes: 10,
+				},
+				{
+					header: { id: "v4-old", createdAt: 100, cwd: "/ws/proj", agentPreset: "standard" },
+					formatStatus: "current",
+					revision: "rev",
+					sizeBytes: 10,
+				},
+				{ header: { id: "v4-other", createdAt: 300, cwd: "/other" } },
+			];
+		},
+	};
+	const rows = await listWorkspaceSessions({
+		sessionsRoot: "/nonexistent",
+		cwd: "/ws/proj",
+		persistence,
+	});
+	assert.deepEqual(rows.map((r) => r.id), ["v4-new", "v4-old"]);
+	assert.equal(rows[0]!.source, "service");
+	assert.equal(rows[1]!.preset, "standard");
+});
+
+test("list: sessionQuery titles come from readTitle / readSession / listEvents", async () => {
+	const query = {
+		async listSessions() {
+			return [
+				{ header: { id: "t-readtitle", createdAt: 3, cwd: "/ws/proj" } },
+				{ header: { id: "t-session", createdAt: 2, cwd: "/ws/proj" } },
+				{ header: { id: "t-events", createdAt: 1, cwd: "/ws/proj" } },
+				{ header: { id: "t-wrapped", createdAt: 0, cwd: "/ws/proj" } },
+			];
+		},
+		async readTitle(id: string): Promise<unknown> {
+			if (id === "t-readtitle") return "Title From Query";
+			// No `session/title` event in the log → falls through to readSession.
+			if (id === "t-session") return undefined;
+			// Some hosts wrap the title in an object; `t-events` also has no
+			// readSession, so only listEvents can supply its title.
+			if (id === "t-wrapped") return { title: "Wrapped Title" };
+			return undefined;
+		},
+		async readSession(id: string) {
+			if (id === "t-session") {
+				return {
+					events: [
+						{
+							type: "user/message",
+							data: {
+								source: { kind: "user" },
+								content: [{ type: "text", text: "首个用户消息作为标题" }],
+							},
+						},
+					],
+				};
+			}
+			return undefined;
+		},
+		async listEvents(_id: string) {
+			return { events: [{ type: "session/title", data: { title: "Title From listEvents" } }] };
+		},
+	};
+	const rows = await listWorkspaceSessions({
+		sessionsRoot: "/nonexistent",
+		cwd: "/ws/proj",
+		query,
+	});
+	const byId = new Map(rows.map((r) => [r.id, r.title]));
+	assert.equal(byId.get("t-readtitle"), "Title From Query");
+	assert.equal(byId.get("t-session"), "首个用户消息作为标题");
+	assert.equal(byId.get("t-events"), "Title From listEvents");
+	assert.equal(byId.get("t-wrapped"), "Wrapped Title");
+});
+
+test("parseGenerationLogFilename: canonical generation names only", () => {
+	assert.equal(parseGenerationLogFilename("session.jsonl"), 0);
+	assert.equal(parseGenerationLogFilename("session.jsonl.zstd"), 0);
+	assert.equal(parseGenerationLogFilename("session.v1.jsonl.zstd"), 1);
+	assert.equal(parseGenerationLogFilename("session.v3.jsonl.zstd"), 3);
+	assert.equal(parseGenerationLogFilename("session.v4.jsonl.zstd"), 4);
+	assert.equal(parseGenerationLogFilename("session.v12.jsonl"), 12);
+	// Not canonical: explicit v0 tag, leading zero, temp/uppercase names.
+	assert.equal(parseGenerationLogFilename("session.v0.jsonl.zstd"), undefined);
+	assert.equal(parseGenerationLogFilename("session.v04.jsonl.zstd"), undefined);
+	assert.equal(parseGenerationLogFilename("session.v4.jsonl.zstd.tmp"), undefined);
+	assert.equal(parseGenerationLogFilename("Session.v4.jsonl.zstd"), undefined);
+	assert.equal(parseGenerationLogFilename("session.lock"), undefined);
+});
+
+test("findSessionLogFile: picks the highest generation in a session dir", () => {
+	const root = mkdtempSync(join(tmpdir(), "dsh-gen-log-"));
+	try {
+		const sessionDir = join(root, "lark-link~003Adm~003Aoc_x~003An1~003A0");
+		mkdirSync(sessionDir, { recursive: true });
+		writeFileSync(join(sessionDir, "session.lock"), "");
+		assert.equal(findSessionLogFile(sessionDir), undefined, "lock file is not a log");
+		writeFileSync(join(sessionDir, "session.jsonl.zstd"), "v0");
+		assert.equal(basename(findSessionLogFile(sessionDir)!), "session.jsonl.zstd");
+		writeFileSync(join(sessionDir, "session.v3.jsonl.zstd"), "v3");
+		assert.equal(basename(findSessionLogFile(sessionDir)!), "session.v3.jsonl.zstd");
+		writeFileSync(join(sessionDir, "session.v4.jsonl.zstd"), "v4");
+		assert.equal(basename(findSessionLogFile(sessionDir)!), "session.v4.jsonl.zstd");
+		// A plaintext artifact of the same generation is preferred only when
+		// no compressed one exists at that generation.
+		writeFileSync(join(sessionDir, "session.v5.jsonl"), "v5-plain");
+		assert.equal(basename(findSessionLogFile(sessionDir)!), "session.v5.jsonl");
+		assert.equal(findSessionLogFile(join(root, "missing")), undefined);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("list: scan fallback recognizes 0.2.1 generation filenames", async () => {
+	const root = mkdtempSync(join(tmpdir(), "dsh-ws-gen-"));
+	try {
+		const dir = join(root, projectKeyOf("/ws/proj"));
+		mkdirSync(join(dir, "lark-link~003Adm~003Aoc_x~003An2~003A0"), { recursive: true });
+		writeFileSync(join(dir, "lark-link~003Adm~003Aoc_x~003An2~003A0", "session.lock"), "");
+		writeFileSync(
+			join(dir, "lark-link~003Adm~003Aoc_x~003An2~003A0", "session.v4.jsonl.zstd"),
+			zstdCompressSync(Buffer.from('{"type":"session"}\n')),
+		);
+		mkdirSync(join(dir, "gui-uuid-9"), { recursive: true });
+		writeFileSync(join(dir, "gui-uuid-9", "session.jsonl.zstd"), "v0");
+		// A third directory with only a lock is not resumable.
+		mkdirSync(join(dir, "no-log"), { recursive: true });
+		writeFileSync(join(dir, "no-log", "session.lock"), "");
+
+		const rows = await listWorkspaceSessions({ sessionsRoot: root, cwd: "/ws/proj" });
+		assert.deepEqual(
+			rows.map((r) => r.id).sort(),
+			["gui-uuid-9", "lark-link:dm:oc_x:n2:0"].sort(),
+		);
+		assert.equal(rows.every((r) => r.source === "scan"), true);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("list: no sources at all returns []", async () => {
+	assert.deepEqual(
+		await listWorkspaceSessions({ sessionsRoot: "/nonexistent", cwd: "/ws/proj" }),
+		[],
+	);
+	const emptyList = { async list() { return []; } };
+	assert.deepEqual(
+		await listWorkspaceSessions({
+			sessionsRoot: "/nonexistent",
+			cwd: "/ws/proj",
+			persistence: emptyList,
+		}),
+		[],
+	);
+});
+
+test("encodeSessionDirName: host encodeSegment parity", () => {
+	assert.equal(
+		encodeSessionDirName("lark-link:dm:oc_x:n1:0"),
+		"lark-link~003Adm~003Aoc_x~003An1~003A0",
+	);
+	assert.equal(encodeSessionDirName("session-1234-abcd"), "session-1234-abcd");
+	assert.equal(encodeSessionDirName("~"), "~007E");
+	assert.equal(encodeSessionDirName("a b"), "a~0020b");
+	assert.equal(encodeSessionDirName("."), "~002E");
+	assert.equal(encodeSessionDirName(".."), "~002E~002E");
+});
+
+test("readSessionLogJsonl: decodes EVERY zstd frame (doctor export fallback)", async () => {
+	const root = mkdtempSync(join(tmpdir(), "dsh-log-jsonl-"));
+	try {
+		const compressed = join(root, "session.v4.jsonl.zstd");
+		// DSH appends one FRAME per commit; whole-file zstd decompression would
+		// stop after the first one, so the reader must walk every frame.
+		const frame1 = zstdCompressSync(Buffer.from('{"type":"session","id":"s1"}\n'));
+		const frame2 = zstdCompressSync(Buffer.from('{"type":"user/message"}\n'));
+		writeFileSync(compressed, Buffer.concat([frame1, frame2]));
+		assert.equal(
+			await readSessionLogJsonl(compressed),
+			'{"type":"session","id":"s1"}\n{"type":"user/message"}\n',
+		);
+
+		const plain = join(root, "session.v5.jsonl");
+		writeFileSync(plain, '{"type":"session"}\n');
+		assert.equal(await readSessionLogJsonl(plain), '{"type":"session"}\n');
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
 });
 
 
