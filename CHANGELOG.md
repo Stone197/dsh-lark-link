@@ -50,6 +50,11 @@
 
 - `cordis.patch.yml` 以字符串插值环境变量，`DSH_WECHAT_ENABLED=0` 会以 `"0"` 传入并被当成真值。新增 `flagOff()` 统一识别 `false/0/no/off`，插件级与微信级开关都能被环境变量正确关闭（临时实例验证：关闭后 `/wechat/api/status` 404，飞书引擎与客户端 bundle 正常）。
 
+### Feature: 工作区锁定
+
+- 新增 `workspaceRoot` 的显式锁定能力：配置后（`/lark-config workspaceRoot=…`、profile `cordis.patch.yml` 或 `DSH_LARK_WORKSPACE_ROOT`）所有飞书/微信新建会话固定落在该目录，不再跟随 GUI 工作区探测；不配置时仍自动跟随 GUI 最近使用的工作区。
+- 微信通道的默认 `cwd` 同步跟随该值。
+
 ### Fix（第二轮 bug 审计：DSH 0.2.1 兼容性）
 
 - **DSH 原生命令全部失败（P1）**：`commands.execute` 在 0.2.1 是四参 `(agent, line, submittedAttachments, signal)`，旧三参把 signal 放错位导致宿主读 `undefined.aborted` 抛错——飞书 `/compact` `/export` `/feedback` 等现在恢复正常。

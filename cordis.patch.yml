@@ -11,6 +11,11 @@
         appId: !!js "process.env.DSH_LARK_LINK_APP_ID ?? ''"
         # groupPolicy: open | mention | keywords | reply
         groupPolicy: !!js "process.env.DSH_LARK_LINK_GROUP_POLICY ?? 'mention'"
+        # Workspace root for bridge sessions. Empty = follow the GUI's most
+        # recently used workspace (auto-detected, never persisted). Set this
+        # (or `DSH_LARK_WORKSPACE_ROOT`) to LOCK every Feishu/WeChat session to
+        # one directory. A profile-level cordis.patch.yml entry can set it too.
+        workspaceRoot: !!js "process.env.DSH_LARK_WORKSPACE_ROOT ?? ''"
         # denyList: exact command prefixes denied outright (no prompt, no card).
         denyList: []
         # GH #14 inbound request replay: set auto:false to disable the
