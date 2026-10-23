@@ -41,6 +41,8 @@ export interface MessageHandlerDeps {
 	 * global timers; unit tests drive flushes deterministically.
 	 */
 	mergeTimers?: TimerApi;
+	/** Persistent diagnostics sink (`<state>/bridge.log`). Never throws. */
+	diag?: (event: string, data?: Record<string, unknown>) => void;
 }
 
 export interface MessageHandler {
@@ -504,20 +506,30 @@ export function createMessageHandler(deps: MessageHandlerDeps): MessageHandler {
 		msg: FeishuInboundMessage,
 		compensated: boolean,
 	): Promise<"processed" | "dropped"> {
+		deps.diag?.("inbound/received", {
+			messageId: msg.messageId,
+			chatId: msg.chatId,
+			msgType: msg.msgType,
+			textChars: (msg.text ?? "").length,
+			compensated,
+		});
 		// 1. dedupe (skip for compensation replay)
 		if (!compensated && !deps.dedupe.add(msg.messageId)) {
 			logger.info(`drop: duplicate ${msg.messageId}`);
+			deps.diag?.("inbound/dropped", { messageId: msg.messageId, reason: "duplicate" });
 			return "dropped";
 		}
 		// 2. allowlist (live getter — hot reload honored per message)
 		const allowlist = deps.allowlist();
 		if (allowlist.length > 0 && !allowlist.includes(msg.senderOpenId)) {
 			logger.info(`drop: sender ${msg.senderOpenId} not in allowlist`);
+			deps.diag?.("inbound/dropped", { messageId: msg.messageId, reason: "allowlist" });
 			return "dropped";
 		}
 		// 3. group trigger
 		if (!deps.groupTrigger.shouldTrigger(msg)) {
 			logger.info(`drop: group policy for ${msg.chatId}`);
+			deps.diag?.("inbound/dropped", { messageId: msg.messageId, reason: "group-policy" });
 			return "dropped";
 		}
 		// 4. reaction receipt (random pool, never DONE) — picker built from live cfg

@@ -50,6 +50,13 @@
 
 - `cordis.patch.yml` 以字符串插值环境变量，`DSH_WECHAT_ENABLED=0` 会以 `"0"` 传入并被当成真值。新增 `flagOff()` 统一识别 `false/0/no/off`，插件级与微信级开关都能被环境变量正确关闭（临时实例验证：关闭后 `/wechat/api/status` 404，飞书引擎与客户端 bundle 正常）。
 
+### Feature: 会话可观测性与记忆保护
+
+- 新增持久诊断日志 `~/.dsh/lark-link/bridge.log`（JSONL，8MB 轮转）：记录插件启动、入站消息/丢弃原因、会话复用/新建/恢复失败（含错误原文）、轮换、空闲回收、图片附件是否带 imageRef 等。桌面宿主不捕获插件 stdout，之前这些失败是不可见的。
+- **会话恢复重试**：恢复上一会话失败时先释放残留 live holder 并重试一次（250ms 间隔）；两次都失败才新建会话。
+- **记忆丢失不再静默**：真的降级到新会话时，桥会在当前聊天发一条提示（含原因与 `/resume` 找回旧会话的建议），并写 `bridge.log`。
+- `/status` 增加 `sessionIdleTtlMs`、`maxSessions` 与诊断日志路径，便于排查“为什么又新建会话”。
+
 ### Feature: 工作区锁定
 
 - 新增 `workspaceRoot` 的显式锁定能力：配置后（`/lark-config workspaceRoot=…`、profile `cordis.patch.yml` 或 `DSH_LARK_WORKSPACE_ROOT`）所有飞书/微信新建会话固定落在该目录，不再跟随 GUI 工作区探测；不配置时仍自动跟随 GUI 最近使用的工作区。

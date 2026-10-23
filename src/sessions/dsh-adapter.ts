@@ -91,6 +91,18 @@ export interface DshAdapterDeps {
 	/** Callback to persist the active session id for this conversation. */
 	setActiveSessionId?: (key: string, sessionId: string | undefined) => void;
 	logger?: { info(msg: string): void; warn(msg: string): void };
+	/** Persistent diagnostics sink (`<state>/bridge.log`). Never throws. */
+	diag?: (event: string, data?: Record<string, unknown>) => void;
+	/**
+	 * Called when an existing conversation could NOT resume its persisted
+	 * session and the bridge silently falls back to a fresh one. The host uses
+	 * it to tell the user in chat (otherwise memory loss is invisible).
+	 */
+	onSessionRecreated?: (
+		key: string,
+		oldSessionId: string | undefined,
+		reason: string,
+	) => void;
 }
 
 /** Agent registry surface we consume (dsh-agent). */
@@ -430,6 +442,7 @@ export function createDshAdapter(deps: DshAdapterDeps): DshSessionBackend {
 	 * before agents.resume / sessionPersistence.prepare can execute.
 	 */
 	const releaseLiveSession = async (targetSessionId: string): Promise<void> => {
+		deps.diag?.("session/release-live", { sessionId: targetSessionId });
 		// 1. Evict from our bridge's tracked map
 		for (const [k, t] of Array.from(tracked.entries())) {
 			if (t.handle.sessionId === targetSessionId) {
@@ -579,6 +592,7 @@ export function createDshAdapter(deps: DshAdapterDeps): DshSessionBackend {
 	// its persisted log on disk survives intact; mint a fresh runNonce so any later create
 	// can never collide with the old id family.
 	const rotateKey = (key: string): void => {
+		deps.diag?.("session/rotate", { key });
 		// A stale text-only twin must not survive rotation — the turn it
 		// belonged to is gone. (imageUnsupported intentionally persists:
 		// the model's lack of image support does not change with the session.)
@@ -610,6 +624,10 @@ export function createDshAdapter(deps: DshAdapterDeps): DshSessionBackend {
 		const existing = tracked.get(key);
 		if (existing) {
 			existing.lastUsedAt = Date.now();
+			deps.diag?.("session/reuse", {
+				key,
+				sessionId: existing.handle.sessionId,
+			});
 			return existing.handle;
 		}
 		// Collapse concurrent ensureAgent(key) calls into a single creation:
@@ -853,18 +871,40 @@ export function createDshAdapter(deps: DshAdapterDeps): DshSessionBackend {
 			const activeId = deps.activeSessionId?.(key);
 			let resumedOwned: AgentHandleSurface | undefined;
 			if (activeId) {
-				try {
-					await releaseLiveSession(activeId);
-					resumedOwned = await c.agents.resume({
-						resumeSessionId: activeId,
-						...(agentOptions ? { agentOptions } : {}),
-						setup,
-					});
-					sessionId = activeId;
-				} catch (err) {
+				let lastErr: unknown;
+				// Two attempts: the first can race a just-retired live holder /
+				// persistence retirement (a hot reload or a concurrent rotate).
+				// Only after both fail do we give up and open a fresh session.
+				for (let attempt = 1; attempt <= 2 && !resumedOwned; attempt++) {
+					try {
+						await releaseLiveSession(activeId);
+						resumedOwned = await c.agents.resume({
+							resumeSessionId: activeId,
+							...(agentOptions ? { agentOptions } : {}),
+							setup,
+						});
+						sessionId = activeId;
+						deps.diag?.("session/resume-ok", { key, sessionId: activeId, attempt });
+					} catch (err) {
+						lastErr = err;
+						deps.diag?.("session/resume-failed", {
+							key,
+							sessionId: activeId,
+							attempt,
+							error: err instanceof Error ? err.message : String(err),
+						});
+						if (attempt === 1) {
+							await new Promise((r) => setTimeout(r, 250));
+						}
+					}
+				}
+				if (!resumedOwned) {
+					const reason =
+						lastErr instanceof Error ? lastErr.message : String(lastErr);
 					deps.logger?.warn(
-						`failed to resume active session "${activeId}" for ${key}: ${err instanceof Error ? err.message : String(err)} — falling back to create fresh session`,
+						`failed to resume active session "${activeId}" for ${key}: ${reason} — falling back to create fresh session`,
 					);
+					deps.onSessionRecreated?.(key, activeId, reason);
 				}
 			}
 
@@ -885,6 +925,12 @@ export function createDshAdapter(deps: DshAdapterDeps): DshSessionBackend {
 						setup,
 					});
 					deps.setActiveSessionId?.(key, sessionId);
+					deps.diag?.("session/create", {
+						key,
+						sessionId,
+						reason: activeId ? "resume-failed" : "no-active-session",
+						...(activeId ? { activeId } : {}),
+					});
 				} catch (err) {
 					if (err instanceof Error && /already exists|already has a persisted log/i.test(err.message)) {
 						try {
@@ -1040,6 +1086,15 @@ export function createDshAdapter(deps: DshAdapterDeps): DshSessionBackend {
 					imageUnsupportedKeys.has(key) ||
 					(modelTag ? imageUnsupportedModels.has(modelTag) : false);
 
+				deps.diag?.("followup", {
+					key,
+					textChars: text.length,
+					attachments: (attachments ?? []).length,
+					images: (attachments ?? []).filter((a) => a.kind === "image").length,
+					imagesWithRef: (attachments ?? []).filter(
+						(a) => a.kind === "image" && a.imageRef,
+					).length,
+				});
 				for (const a of attachments ?? []) {
 					if (a.kind === "image") {
 						if (a.imageRef && !isUnsupported) {
@@ -1376,6 +1431,7 @@ export function createDshAdapter(deps: DshAdapterDeps): DshSessionBackend {
 				}
 			}
 			for (const { key, handle } of toDispose) {
+				deps.diag?.("session/idle-dispose", { key, sessionId: handle.sessionId });
 				tracked.delete(key);
 				keyBySession.delete(handle.sessionId);
 				generations.set(key, (generations.get(key) ?? 0) + 1);

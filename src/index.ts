@@ -64,6 +64,7 @@ import {
 	autoReplayEnabled,
 } from "./common/config.ts";
 import { createLogger, type Logger } from "./common/logger.ts";
+import { createBridgeLog } from "./common/bridge-log.ts";
 import { createDedupeStore } from "./common/dedupe-store.ts";
 import { createInboundWal } from "./inbound/inbound-wal.ts";
 import { createReplaySalvage } from "./inbound/replay-salvage.ts";
@@ -258,6 +259,8 @@ export function apply(ctx: Context, rawConfig: unknown): void {
 	const dir = stateDir();
 	mkdirSync(dir, { recursive: true });
 	const logger: Logger = createLogger("lark-link");
+	const bridgeLog = createBridgeLog(dir);
+	bridgeLog.event("plugin/apply", { stateDir: dir });
 
 	// ---- config / status / stores -------------------------------------------
 	// Explicit workspace override only (env/patch config). The GUI's own
@@ -422,6 +425,22 @@ export function apply(ctx: Context, rawConfig: unknown): void {
 			// GH #8: bridge sessions carry the bridge's permission preset at
 			// creation/resume — the host-wide default is never modified.
 			permissionMode: () => getCfg().permissionMode,
+			diag: (event, data) => bridgeLog.event(event, data),
+			// Memory-loss must never be silent: a conversation that could not
+			// resume its previous session gets an explicit chat notice.
+			onSessionRecreated: (key, oldSessionId, reason) => {
+				const route = routeStore.get(key);
+				if (!route?.chatId) return;
+				void sender
+					.sendText(
+						route.chatId,
+						`⚠️ 上一会话恢复失败（${reason.slice(0, 160)}），已开启新会话，上下文从零开始。\n` +
+							`旧会话仍保存在磁盘上，可发 /resume 找回并继续。\n` +
+							`（诊断日志：~/.dsh/lark-link/bridge.log）`,
+					)
+					.catch(() => undefined);
+				bridgeLog.event("session/recreated-notified", { key, oldSessionId });
+			},
 		});
 	} catch (err) {
 		logger.warn(
@@ -533,6 +552,9 @@ export function apply(ctx: Context, rawConfig: unknown): void {
 										runCard: cfg.streaming.runCard,
 									},
 									inboundMerge: cfg.inboundMerge,
+									sessionIdleTtlMs: cfg.sessionIdleTtlMs,
+									maxSessions: cfg.maxSessions,
+									diagnostics: { bridgeLog: bridgeLog.path },
 									replay: cfg.replay ?? {
 										auto: true,
 										retentionMinutes: 30,
@@ -2262,6 +2284,7 @@ export function apply(ctx: Context, rawConfig: unknown): void {
 		dedupe,
 		allowlist: () => getCfg().allowlist,
 		wal: inboundWal,
+		diag: (event, data) => bridgeLog.event(event, data),
 		// Persist inbound Feishu images/files as real local files so a
 		// non-vision model / external tooling can read them off disk (the
 		// DSH attachment store alone is in-memory). Root: OS TEMP DIR by
