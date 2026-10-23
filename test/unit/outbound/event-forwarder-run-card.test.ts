@@ -261,3 +261,29 @@ test("forwarder run card: finalizeSession settles a still-running card durably",
   assert.equal(run.finals[0]!.config.streaming_mode, false);
   assert.equal(sent.length, 0, "card finalize counts as delivery");
 });
+
+// Regression (BUG audit A, found by the fake-ctx + real-apply harness):
+// index.ts dispatches forwarder calls with `void`, so turn/end may run while
+// assistant/message is awaiting the rate-gated card push. turn/end clears
+// st.runView BEFORE awaiting finalizeCard; the old post-await
+// `runCardActive(st)` check then read false and enqueued a DUPLICATE plain-text
+// reply even though the run card had already delivered the same text.
+test("forwarder run card: interleaved turn/end does not duplicate the reply as text", async () => {
+  const { fw, run, sent, outbox } = setup();
+  await fw.onSessionEvent("dm:ou_x", { type: "turn/start" });
+
+  // Fire assistant/message and turn/end concurrently — exactly how the host's
+  // `void forwarder.onSessionEvent(...)` fan-out dispatches adjacent events.
+  const message = fw.onSessionEvent("dm:ou_x", {
+    type: "assistant/message",
+    text: "同一个回复",
+  });
+  const end = fw.onSessionEvent("dm:ou_x", { type: "turn/end", reason: "completed" });
+  await Promise.all([message, end]);
+  await new Promise((r) => setTimeout(r, 150));
+
+  assert.equal(run.finals.length, 1, "turn/end finalized the run card");
+  assert.ok(panelText(run.finals[0]!).includes("同一个回复"), "card carries the reply");
+  assert.equal(sent.length, 0, "the card is the delivery — no duplicate text message");
+  assert.equal(outbox.pendingCount(), 0);
+});

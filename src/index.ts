@@ -1558,8 +1558,10 @@ export function apply(ctx: Context, rawConfig: unknown): void {
 					| {
 							listProviders?(): Array<{ id?: string; name?: string }>;
 							listConfigurableProviders?(): Array<{
-								id?: string;
-								name?: string;
+								/** Route key (host type: `provider`). */
+								provider?: string;
+								/** Human-readable name (host type: `displayName`). */
+								displayName?: string;
 							}>;
 							listModels?(
 								p: string,
@@ -1590,7 +1592,10 @@ export function apply(ctx: Context, rawConfig: unknown): void {
 					if (!Array.isArray(providers) || providers.length === 0) {
 						try {
 							providers = (llm?.listConfigurableProviders?.() ?? []).map(
-								(p) => ({ id: p.id, name: p.name ?? p.id }),
+								(p) => ({
+									id: p.provider,
+									name: p.displayName ?? p.provider,
+								}),
 							);
 						} catch {
 							providers = [];
@@ -1691,7 +1696,13 @@ export function apply(ctx: Context, rawConfig: unknown): void {
 				// Accept historical alias `code` as `ptc` (GH #11).
 				const requested = arg ? normalizeAgentPreset(arg) : "";
 				if (!arg) {
-					const current = normalizeAgentPreset(getCfg().agentPreset);
+					// Mark the CURRENT preset from the per-conversation override, not
+					// the bridge default: after `/mode standard` in one chat, the
+					// next `/mode` card must say standard is current (BUG audit A).
+					const current = normalizeAgentPreset(
+						convCfg.get(bridge.conversationKeyFor(msg)).preset ??
+							getCfg().agentPreset,
+					);
 					const unknownCurrent =
 						live.length > 0 && !live.some((p) => p.id === current);
 					await sender.sendCard(
@@ -1836,6 +1847,9 @@ export function apply(ctx: Context, rawConfig: unknown): void {
 
 	// Card action routing (schema 2.0 behaviors:[{type:"callback",value}]):
 	// a button click arrives as card.action.trigger with the op value.
+	/** Monotonic counter for unique pseudo message ids per card click. */
+	let cardActionSeq = 0;
+
 	const handleCardAction = async (data: unknown): Promise<void> => {
 		try {
 			const raw = data as {
@@ -2053,18 +2067,19 @@ export function apply(ctx: Context, rawConfig: unknown): void {
 			const sep = op.indexOf(":");
 			const cmd = sep === -1 ? op : op.slice(0, sep);
 			const arg = sep === -1 ? "" : op.slice(sep + 1);
-			// messageId must be UNIQUE per click: durableReply dedupes command
-			// replies by `bridge:<cmd>:<messageId>`, and the card message id is
-			// the same for every click on that card — a second click (e.g.
-			// picking another model from the picker) used to be swallowed as a
-			// duplicate, so the user got NO confirmation for the new choice.
+			// messageId must be UNIQUE per CLICK (not per card+op): durableReply
+			// dedupes command replies by `bridge:<cmd>:<messageId>`. A card's
+			// message id is stable across clicks, and clicking the SAME button
+			// twice (e.g. re-picking the current model) is a legitimate action —
+			// keying on `${messageId}#${op}` used to swallow the second reply
+			// entirely (BUG audit A#3). A monotonic per-click counter keeps every
+			// click's reply unique while staying deterministic for tests.
 			// chatType: reuse the known route for this chat so the pseudo message
 			// lands on the right conversation lane (group vs dm).
 			const knownRoute = routeStore.all().find((r) => r.chatId === chatId);
+			cardActionSeq += 1;
 			const pseudo: FeishuInboundMessage = {
-				messageId: messageId
-					? `${messageId}#${op}`
-					: `card#${Date.now()}#${op}`,
+				messageId: `${messageId || "card"}#${Date.now()}#${cardActionSeq}#${op}`,
 				chatId,
 				chatType: knownRoute?.chatType === "group" ? "group" : "p2p",
 				chatMode: knownRoute?.chatType === "group" ? "group_all" : "p2p",

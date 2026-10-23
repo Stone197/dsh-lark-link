@@ -39,6 +39,12 @@
 
 ### Fix
 
+- **runCard 并发重复回复（真实竞态）**：`assistant/message` 与 `turn/end` 相邻到达时，`turn/end` 会在 `await finalizeCard` 前清空 runView，旧逻辑据此误判卡片已失效并把同一回复又发一条纯文本。现在入口即判定卡片归属，卡片路径独占该轮投递，不再重复。
+- **`/mode` 卡片“← 当前”标记**：改为读取本会话的 preset override（`convCfg`），切换后再次打开卡片会正确标注当前模式。
+- **同一卡片按钮重复点击无回执**：卡点击伪 messageId 改为每次点击唯一（cardId + 时间 + 单调序号 + op），重复点选同一模型/模式也会有确认回执。
+- **`/model` 目录回退**：宿主 `listProviders()` 为空时回退 `listConfigurableProviders()`（按宿主真实字段 `provider`/`displayName` 映射）；仍为空则回文本诊断（含 llm/providers 计数），卡片发送失败回退文字列表。
+- **新增测试**：假 Cordis ctx + 真 `apply()` 的集成 harness（18 个命令/消息场景，含 card.action 按钮链路、runCard on/off、/cd /ws、微信 flagOff），以及 runCard 并发与重复点击回归测试。全量 `node:test` 448 项、vitest 985 项通过。
+
 - **保持原版交互**：`/help` 恢复原版文本清单（仅追加 `/cd` `/ws` 两行）；`/status` 恢复原版文本回复；运行卡片与防抖合并改为 opt-in，默认行为与此前一致。
 - **会话默认工作区**：桥会话默认落到 GUI 当前使用的工作区（读 `<DSH_HOME>/storages/workspace.json`），不再使用桌面进程 cwd（profile 目录），新会话能在 GUI 会话列表里看到。
 

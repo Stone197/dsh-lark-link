@@ -237,6 +237,17 @@ export function createEventForwarder(deps: EventForwarderDeps): EventForwarder {
 
         // Run card mode: the card accumulates blocks and is delivered at
         // turn/end, so do not enqueue a duplicate plain-text message.
+        //
+        // RACE (found by test/integration/apply-commands.test.ts): index.ts
+        // launches forwarder calls with `void`, so turn/end can run while this
+        // branch is awaiting the rate-gated card push. turn/end clears
+        // st.runView/st.runHandle BEFORE awaiting finalizeCard, so the old
+        // post-await `runCardActive(st)` check read false and enqueued a
+        // DUPLICATE plain-text reply even though the run card had already
+        // delivered the same text. Ownership is decided at entry: once the
+        // turn owns a run card, the card path owns this turn's delivery —
+        // turn/end either finalizes the card (content lands) or falls back to
+        // the outbox itself, so no message is lost either way.
         if (runCardActive(st)) {
           st.runView = reduceRunView(st.runView!, {
             type: "message",
@@ -244,8 +255,7 @@ export function createEventForwarder(deps: EventForwarderDeps): EventForwarder {
             reasoning: event.reasoning,
           });
           await pushRunCard(st, route);
-          if (runCardActive(st)) break; // card owns the delivery
-          // Card died mid-turn → fall through to the durable paths below.
+          break; // card path owns delivery for this turn (see RACE above)
         }
 
         if (!hasText) return;
